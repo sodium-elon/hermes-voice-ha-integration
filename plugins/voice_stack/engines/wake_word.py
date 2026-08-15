@@ -311,14 +311,29 @@ class CommandWWEngine(WakeWordEngine):
 
     def listen(self, timeout_seconds: float = 60.0) -> bool:
         cmd = [part.replace("{timeout}", str(int(timeout_seconds))) for part in self._command]
-        self._proc = subprocess.Popen(cmd)
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
         try:
-            return self._proc.wait(timeout=timeout_seconds + 5) == 0
+            stdout, _ = self._proc.communicate(timeout=timeout_seconds + 5)
+            detected = self._proc.returncode == 0
         except subprocess.TimeoutExpired:
             self.stop()
             return False
         finally:
             self._proc = None
+
+        if detected:
+            # Detection happened wherever the command runs, so there is no score
+            # or threshold to report -- only the name it printed, if any. Emit
+            # regardless: the other engines open the turn here, and without it
+            # the monitor shows no wake at all and every later stage of the
+            # interaction lands in turn 0.
+            events.begin_turn()
+            events.emit(
+                "wake",
+                engine="command",
+                word=(stdout or "").strip() or "unknown",
+            )
+        return detected
 
     def stop(self) -> None:
         if self._proc and self._proc.poll() is None:

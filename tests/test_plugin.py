@@ -927,6 +927,54 @@ class TestWakeWordEngine:
         engine = create_wake_word_engine("command", command=["/bin/false"])
         assert engine.listen(timeout_seconds=1.0) is False
 
+    def test_command_engine_emits_wake_event(self, monkeypatch):
+        """A detection must open a turn and emit 'wake'.
+
+        The monitor renders wake events; the other engines emit one on every
+        hit. When this is missing the pipeline still works but goes invisible,
+        and every later stage is attributed to turn 0.
+        """
+        from plugins.voice_stack import events
+        from plugins.voice_stack.engines.wake_word import create_wake_word_engine
+
+        emitted = []
+        turns = []
+        monkeypatch.setattr(events, "emit", lambda kind, **f: emitted.append((kind, f)))
+        monkeypatch.setattr(events, "begin_turn", lambda: turns.append(1) or 1)
+
+        engine = create_wake_word_engine(
+            "command", command=["/bin/echo", "hey_jarvis_v0.1"]
+        )
+        assert engine.listen(timeout_seconds=1.0) is True
+
+        assert len(turns) == 1, "detection must open exactly one turn"
+        assert emitted == [("wake", {"engine": "command", "word": "hey_jarvis_v0.1"})]
+
+    def test_command_engine_emits_no_wake_event_on_timeout(self, monkeypatch):
+        from plugins.voice_stack import events
+        from plugins.voice_stack.engines.wake_word import create_wake_word_engine
+
+        emitted = []
+        monkeypatch.setattr(events, "emit", lambda kind, **f: emitted.append(kind))
+        monkeypatch.setattr(events, "begin_turn", lambda: 1)
+
+        engine = create_wake_word_engine("command", command=["/bin/false"])
+        assert engine.listen(timeout_seconds=1.0) is False
+        assert emitted == [], "a non-detection must not open a turn"
+
+    def test_command_engine_wake_word_falls_back_when_silent(self, monkeypatch):
+        """A detector that prints nothing still produces a usable event."""
+        from plugins.voice_stack import events
+        from plugins.voice_stack.engines.wake_word import create_wake_word_engine
+
+        emitted = []
+        monkeypatch.setattr(events, "emit", lambda kind, **f: emitted.append((kind, f)))
+        monkeypatch.setattr(events, "begin_turn", lambda: 1)
+
+        engine = create_wake_word_engine("command", command=["/bin/true"])
+        assert engine.listen(timeout_seconds=1.0) is True
+        assert emitted == [("wake", {"engine": "command", "word": "unknown"})]
+
     def test_openwakeword_engine_uses_configured_threshold(self):
         from plugins.voice_stack.engines.wake_word import OpenWakeWordEngine
 
