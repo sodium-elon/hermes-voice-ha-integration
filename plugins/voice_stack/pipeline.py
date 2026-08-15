@@ -35,7 +35,23 @@ class VoiceRecordingError(RuntimeError):
 
 
 def _play_wake_beep() -> None:
-    """Play a best-effort local cue after wake-word detection."""
+    """Play a best-effort local cue after wake-word detection.
+
+    Fire-and-forget by design. The cue goes to the default sink, which here is
+    HDMI and disappears with the TV, and playing it synchronously made audio
+    *capture* depend on audio *output*. Measured 2026-08-15 with the display
+    asleep: the call still blocked ~0.75s, so the recording window opened after
+    the command had already been spoken and Whisper transcribed an empty room.
+
+    The beep is a nicety when the speakers are awake; the microphone path must
+    never wait on it. A daemon thread also reaps the child, which a bare Popen
+    here would leave as a zombie once per wake word.
+    """
+    threading.Thread(target=_play_wake_beep_blocking, daemon=True).start()
+
+
+def _play_wake_beep_blocking() -> None:
+    """Actually play the cue. Runs off the pipeline thread; never raises."""
     try:
         try:
             duration = float(os.getenv("HERMES_WAKE_BEEP_DURATION", "0.60"))
