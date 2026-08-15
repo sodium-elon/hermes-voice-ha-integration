@@ -45,6 +45,13 @@ config:
     type: str
     default: ""
     description: Comma-separated custom OpenWakeWord .tflite or .onnx model paths
+  HERMES_WAKE_WORD_COMMAND:
+    type: str
+    default: ""
+    description: >-
+      Command for the "command" wake engine; exits 0 on detection, non-zero on
+      timeout. {timeout} is substituted with the per-call timeout in seconds.
+      Used when wake detection runs on another host that owns the microphone.
   HERMES_WAKE_WORD_THRESHOLD:
     type: float
     default: 0.55

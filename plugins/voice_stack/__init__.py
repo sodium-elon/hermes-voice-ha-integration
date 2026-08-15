@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import threading
 import time
 from pathlib import Path
@@ -55,6 +56,10 @@ def _get_config() -> Dict[str, Any]:
             # non-speech triggers (calibrated 2026-08-15).
             "vad_threshold": float(v) if (v := os.getenv("HERMES_WAKE_VAD_THRESHOLD", "0.5").strip()) else None,
             "cooldown": float(os.getenv("HERMES_WAKE_COOLDOWN", "5.0")),
+            # Argv for the "command" engine, used when wake detection runs off
+            # this host (e.g. a Wyoming satellite on the machine that owns the
+            # mic). CommandWWEngine substitutes {timeout} at call time.
+            "command": shlex.split(os.getenv("HERMES_WAKE_WORD_COMMAND", "")),
         },
         "stt": {
             "engine": os.getenv("HERMES_STT_ENGINE", "faster-whisper"),
@@ -124,6 +129,7 @@ def _init_engines() -> bool:
             model_paths=config["wake_word"]["model_paths"],
             threshold=config["wake_word"]["threshold"],
             vad_threshold=config["wake_word"].get("vad_threshold"),
+            command=config["wake_word"].get("command") or ["false"],
         )
     except Exception as exc:
         logger.warning("Wake word engine init failed: %s", exc)

@@ -890,6 +890,43 @@ class TestWakeWordEngine:
         ]
         assert config["wake_word"]["threshold"] == 0.40
 
+    def test_voice_config_parses_wake_word_command(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+
+        monkeypatch.setenv(
+            "HERMES_WAKE_WORD_COMMAND", "/usr/local/bin/wake-wait --timeout {timeout}"
+        )
+
+        config = voice_stack._get_config()
+
+        assert config["wake_word"]["command"] == [
+            "/usr/local/bin/wake-wait",
+            "--timeout",
+            "{timeout}",
+        ]
+
+    def test_voice_config_wake_word_command_defaults_empty(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+
+        monkeypatch.delenv("HERMES_WAKE_WORD_COMMAND", raising=False)
+
+        assert voice_stack._get_config()["wake_word"]["command"] == []
+
+    def test_command_engine_substitutes_timeout(self):
+        from plugins.voice_stack.engines.wake_word import create_wake_word_engine
+
+        engine = create_wake_word_engine(
+            "command", command=["/bin/true", "--timeout", "{timeout}"]
+        )
+        # CommandWWEngine treats exit 0 as a detection.
+        assert engine.listen(timeout_seconds=1.0) is True
+
+    def test_command_engine_nonzero_exit_is_no_detection(self):
+        from plugins.voice_stack.engines.wake_word import create_wake_word_engine
+
+        engine = create_wake_word_engine("command", command=["/bin/false"])
+        assert engine.listen(timeout_seconds=1.0) is False
+
     def test_openwakeword_engine_uses_configured_threshold(self):
         from plugins.voice_stack.engines.wake_word import OpenWakeWordEngine
 
