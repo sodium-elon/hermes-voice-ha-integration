@@ -51,6 +51,8 @@ _SERVICE_CACHE_TTL_SECONDS = 300.0    # services change rarely
 _LIST_ENTITIES_TIMEOUT = 10.0
 _GET_STATE_TIMEOUT = 8.0
 _CALL_SERVICE_TIMEOUT = 12.0
+_CONVERSATION_TIMEOUT = 15.0
+_DEFAULT_CONVERSATION_AGENT = "conversation.home_assistant"
 
 # Blocked domains (mirrors core homeassistant_tool.py)
 _BLOCKED_DOMAINS = frozenset({
@@ -196,6 +198,38 @@ async def _async_call_service(
             return await resp.json()
 
 
+async def _async_process_conversation(
+    text: str,
+    language: str,
+    conversation_id: Optional[str],
+    agent_id: str,
+) -> Dict[str, Any]:
+    """Process text through Home Assistant's authenticated Conversation API."""
+    import aiohttp
+
+    url, token = _get_config()
+    if not token:
+        raise RuntimeError("HASS_TOKEN is not configured")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload: Dict[str, Any] = {
+        "text": text,
+        "language": language,
+        "agent_id": agent_id,
+    }
+    if conversation_id:
+        payload["conversation_id"] = conversation_id
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{url}/api/conversation/process",
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=_CONVERSATION_TIMEOUT),
+        ) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+
 async def _async_list_services() -> List[Dict[str, Any]]:
     """Fetch available HA services."""
     import aiohttp
@@ -283,6 +317,23 @@ def search_entities(
             "friendly_name": e.get("attributes", {}).get("friendly_name", ""),
         })
     return {"count": len(result), "entities": result}
+
+
+def process_conversation(
+    text: str,
+    *,
+    language: str = "en",
+    conversation_id: Optional[str] = None,
+    agent_id: str = _DEFAULT_CONVERSATION_AGENT,
+) -> Dict[str, Any]:
+    """Send text to HA's built-in conversation agent without Hermes recursion."""
+    try:
+        return _run_async(
+            _async_process_conversation(text, language, conversation_id, agent_id)
+        )
+    except Exception as exc:
+        logger.error("HA conversation processing failed: %s", exc)
+        return {"error": f"Home Assistant conversation failed: {exc}"}
 
 
 def call_service(

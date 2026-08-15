@@ -16,6 +16,7 @@ _CARD_NAME = "hermes-action-bar"
 
 # hacsfiles resource path  (= what appears after /hacsfiles/ in card type)
 _STATIC_URL = "/hermes_static/hermes_action_bar.js"
+_REGISTERED_KEY = f"{DOMAIN}_frontend_registered"
 
 # ---------------------------------------------------------------------------
 # Lovelace card resource
@@ -62,10 +63,14 @@ async def async_get_picture_card_content(
 
 async def async_register_resources(hass) -> None:
     """Serve and register the HermesActionBar card as a dashboard resource."""
+    if hass.data.get(_REGISTERED_KEY):
+        return
+
     static_path = Path(__file__).parent / "hacsfiles" / "hermes_action_bar.js"
     await hass.http.async_register_static_paths([
         StaticPathConfig(_STATIC_URL, str(static_path), cache_headers=True)
     ])
+    hass.data[_REGISTERED_KEY] = True
 
     try:
         from homeassistant.components.lovelace import _CONF_RESOURCES as RES_KEY  # type: ignore

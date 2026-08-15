@@ -24,10 +24,18 @@ import pytest
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def _env(monkeypatch):
-    """Ensure test isolation — clean HASS env vars."""
+def _env(monkeypatch, tmp_path):
+    """Ensure test isolation — clean HASS env vars.
+
+    Also redirect the HA audit log: tests must never append fake
+    service calls (scene.nonexistent, light.a/b/c ...) to the real
+    ~/.hermes/ha_audit.log, where hermes-voice-monitor surfaces them
+    as alarming "blocked: error" lines.
+    """
     monkeypatch.delenv("HASS_URL", raising=False)
     monkeypatch.delenv("HASS_TOKEN", raising=False)
+    from plugins.home_assistant import security
+    monkeypatch.setattr(security, "_AUDIT_LOG_FILE", tmp_path / "ha_audit_test.log")
 
 
 @pytest.fixture
@@ -40,6 +48,41 @@ def with_hass(monkeypatch):
 # ---------------------------------------------------------------------------
 # Bridge tests
 # ---------------------------------------------------------------------------
+
+class TestConversationBridge:
+    def test_process_conversation_explicitly_targets_builtin_agent(self, with_hass, monkeypatch):
+        from plugins.home_assistant import ha_assistant
+
+        calls = []
+
+        async def fake_process(text, language, conversation_id, agent_id):
+            calls.append((text, language, conversation_id, agent_id))
+            return {"response": {"response_type": "action_done"}}
+
+        monkeypatch.setattr(
+            ha_assistant,
+            "_async_process_conversation",
+            fake_process,
+            raising=False,
+        )
+
+        result = ha_assistant.process_conversation(
+            "Turn on the kitchen light",
+            language="en",
+            conversation_id="voice-1",
+            agent_id="conversation.home_assistant",
+        )
+
+        assert result["response"]["response_type"] == "action_done"
+        assert calls == [
+            (
+                "Turn on the kitchen light",
+                "en",
+                "voice-1",
+                "conversation.home_assistant",
+            )
+        ]
+
 
 class TestEntityCache:
     """EntityCache TTL and invalidation."""
@@ -252,7 +295,17 @@ class TestBlockedDomains:
 class TestCompoundTools:
     """Tests for control_light_and_set_scene and turn_off_all_except."""
 
-    def test_control_light_and_set_scene_missing_scene(self):
+    def test_control_light_and_set_scene_missing_scene(self, monkeypatch):
+        # Never hit a real HA server from tests: without this mock the
+        # handler falls back to http://homeassistant.local:8123, burns a
+        # real DNS lookup, and used to log "blocked: error" entries into
+        # ~/.hermes/ha_audit.log (surfaced by hermes-voice-monitor).
+        async def _mock_call(*a, **kw):
+            raise RuntimeError("404: Entity 'scene.nonexistent' not found (mocked)")
+        monkeypatch.setattr(
+            "plugins.home_assistant.ha_assistant._async_call_service", _mock_call
+        )
+
         from plugins.home_assistant.compound import _handle_control_light_and_set_scene
         result = _handle_control_light_and_set_scene({"scene": "scene.nonexistent"})
         data = json.loads(result)
@@ -704,6 +757,79 @@ class TestSTTEngine:
         assert callable(engine.available)
         assert callable(engine.transcribe)
 
+    def test_faster_whisper_passes_voice_vocabulary_and_vad_to_model(self):
+        from types import SimpleNamespace
+        from plugins.voice_stack.engines.stt import FasterWhisperEngine
+
+        calls = []
+
+        class FakeModel:
+            def transcribe(self, audio_path, **kwargs):
+                calls.append((audio_path, kwargs))
+                return (
+                    [SimpleNamespace(text=" Turn on CNN.", avg_logprob=-0.7)],
+                    SimpleNamespace(language="en"),
+                )
+
+        engine = FasterWhisperEngine(
+            model_size="small.en",
+            initial_prompt="Home Assistant commands include: turn on CNN.",
+            hotwords="CNN, LCI, TF1, Firedroid",
+            vad_filter=True,
+        )
+        engine._model = FakeModel()
+
+        result = engine.transcribe_with_confidence("sample.wav", language="en")
+
+        assert result["text"] == "Turn on CNN."
+        assert calls == [
+            (
+                "sample.wav",
+                {
+                    "language": "en",
+                    "beam_size": 5,
+                    "initial_prompt": "Home Assistant commands include: turn on CNN.",
+                    "hotwords": "CNN, LCI, TF1, Firedroid",
+                    "vad_filter": True,
+                    "condition_on_previous_text": False,
+                },
+            )
+        ]
+
+    def test_faster_whisper_gates_no_speech_and_logprob(self):
+        from types import SimpleNamespace
+        from plugins.voice_stack.engines.stt import FasterWhisperEngine
+
+        calls = []
+
+        class FakeModel:
+            def transcribe(self, audio_path, **kwargs):
+                calls.append((audio_path, kwargs))
+                return (
+                    [SimpleNamespace(text=" Turn on CNN.", avg_logprob=-0.7)],
+                    SimpleNamespace(language="en"),
+                )
+
+        engine = FasterWhisperEngine(
+            model_size="small.en",
+            no_speech_threshold=0.6,
+            log_prob_threshold=-1.0,
+        )
+        engine._model = FakeModel()
+
+        engine.transcribe_with_confidence("sample.wav", language="en")
+
+        opts = calls[0][1]
+        assert opts["no_speech_threshold"] == 0.6
+        assert opts["log_prob_threshold"] == -1.0
+
+    def test_openwakeword_engine_vad_and_threshold(self):
+        from plugins.voice_stack.engines.wake_word import OpenWakeWordEngine
+
+        engine = OpenWakeWordEngine(threshold=0.55, vad_threshold=0.5)
+        assert engine._threshold == 0.55
+        assert engine._vad_threshold == 0.5
+
     def test_whisper_cpp_engine_exists(self):
         from plugins.voice_stack.engines.stt import WhisperCPPEngine
         engine = WhisperCPPEngine()
@@ -749,6 +875,73 @@ class TestWakeWordEngine:
         engine = OpenWakeWordEngine()
         assert callable(engine.available)
         assert callable(engine.listen)
+
+    def test_voice_config_accepts_custom_openwakeword_model_paths(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+
+        monkeypatch.setenv("HERMES_WAKE_WORD_MODEL", "/models/hey_ria.tflite,/models/backup.onnx")
+        monkeypatch.setenv("HERMES_WAKE_WORD_THRESHOLD", "0.40")
+
+        config = voice_stack._get_config()
+
+        assert config["wake_word"]["model_paths"] == [
+            "/models/hey_ria.tflite",
+            "/models/backup.onnx",
+        ]
+        assert config["wake_word"]["threshold"] == 0.40
+
+    def test_openwakeword_engine_uses_configured_threshold(self):
+        from plugins.voice_stack.engines.wake_word import OpenWakeWordEngine
+
+        engine = OpenWakeWordEngine(threshold=0.40)
+
+        assert engine._threshold == 0.40
+
+    def test_openwakeword_reuses_model_and_stream_across_timeouts(self, monkeypatch):
+        import time
+        from openwakeword import model as model_module
+        import pyaudio
+        from plugins.voice_stack.engines.wake_word import OpenWakeWordEngine
+
+        model_inits = []
+        stream_opens = []
+        clock = iter([0.0, 6.0, 6.0, 12.0])
+
+        class FakeModel:
+            def __init__(self, **kwargs):
+                model_inits.append(kwargs)
+
+            def predict(self, _pcm):
+                return {"hey_jarvis": 0.0}
+
+        class FakeStream:
+            def read(self, _size, exception_on_overflow=False):
+                return b"\x00\x00" * 1280
+
+            def stop_stream(self):
+                return None
+
+            def close(self):
+                return None
+
+        class FakePyAudio:
+            def open(self, **kwargs):
+                stream_opens.append(kwargs)
+                return FakeStream()
+
+            def terminate(self):
+                return None
+
+        monkeypatch.setattr(model_module, "Model", FakeModel)
+        monkeypatch.setattr(pyaudio, "PyAudio", FakePyAudio)
+        monkeypatch.setattr(time, "monotonic", lambda: next(clock))
+
+        engine = OpenWakeWordEngine(model_paths=["hey_jarvis.onnx"], threshold=0.4)
+
+        assert engine.listen(timeout_seconds=5.0) is False
+        assert engine.listen(timeout_seconds=5.0) is False
+        assert len(model_inits) == 1
+        assert len(stream_opens) == 1
 
     def test_create_wake_word_engine_factory(self):
         from plugins.voice_stack.engines.wake_word import (
@@ -801,6 +994,262 @@ class TestPipelineState:
         prompt = build_voice_system_prompt(entities=entities)
         assert "light.kitchen" in prompt
 
+    def test_pipeline_uses_configured_speech_floor_and_resets_empty_wake(self, monkeypatch):
+        from plugins.voice_stack import pipeline as pipeline_module
+        from plugins.voice_stack.pipeline import VoicePipeline
+
+        record_calls = []
+
+        class FakeSTT:
+            def available(self):
+                return True
+
+        class FakeTTS:
+            def available(self):
+                return True
+
+        voice_pipeline = VoicePipeline(
+            callback=lambda _text: "Done.",
+            stt_engine=FakeSTT(),
+            tts_engine=FakeTTS(),
+            speech_threshold=0.005,
+        )
+        voice_pipeline.state.enabled = True
+        voice_pipeline.state.wake_word_detected = True
+
+        def no_speech(*_args, **kwargs):
+            record_calls.append(kwargs)
+            voice_pipeline.state.enabled = False
+            return False
+
+        monkeypatch.setattr(pipeline_module, "record_audio", no_speech)
+
+        voice_pipeline._run_loop()
+
+        assert record_calls[0]["silence_threshold"] == 0.005
+        assert voice_pipeline.state.wake_word_detected is False
+
+    def test_loud_float_audio_is_normalized_without_pcm_wraparound(self):
+        import numpy as np
+        from plugins.voice_stack.pipeline import _float_audio_to_pcm16
+
+        pcm = _float_audio_to_pcm16(
+            np.array([-1.35, -1.0, -0.25, 0.0, 0.25, 1.0, 1.35], dtype=np.float32)
+        )
+
+        assert pcm.dtype == np.int16
+        assert list(pcm) == sorted(pcm)
+        assert pcm[0] < 0 < pcm[-1]
+        assert abs(int(pcm[0])) <= 32767
+        assert int(pcm[-1]) <= 32767
+
+    def test_low_confidence_transcript_is_processed_without_confirmation(self, monkeypatch):
+        from plugins.voice_stack import pipeline as pipeline_module
+        from plugins.voice_stack.pipeline import VoicePipeline
+
+        callbacks = []
+        languages = []
+        spoken = []
+
+        class FakeSTT:
+            def available(self):
+                return True
+
+            def transcribe_with_confidence(self, _audio_path, language=None):
+                languages.append(language)
+                voice_pipeline.state.enabled = False
+                return {"text": "Turn on the kitchen light", "confidence": 0.2}
+
+        class FakeTTS:
+            def available(self):
+                return True
+
+        voice_pipeline = VoicePipeline(
+            callback=lambda text: callbacks.append(text) or "Done.",
+            stt_engine=FakeSTT(),
+            tts_engine=FakeTTS(),
+            language="en",
+            confidence_threshold=0.7,
+        )
+        voice_pipeline.state.enabled = True
+        monkeypatch.setattr(pipeline_module, "record_audio", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(voice_pipeline, "_speak", lambda text: spoken.append(text) or True)
+
+        voice_pipeline._run_loop()
+
+        assert languages == ["en"]
+        assert callbacks == ["Turn on the kitchen light"]
+        assert spoken == ["Done."]
+
+    def test_hallucination_below_confidence_floor_is_silently_dropped(self, monkeypatch):
+        from plugins.voice_stack import pipeline as pipeline_module
+        from plugins.voice_stack.pipeline import VoicePipeline
+
+        callbacks = []
+        spoken = []
+
+        class FakeSTT:
+            def available(self):
+                return True
+
+            def transcribe_with_confidence(self, _audio_path, language=None):
+                voice_pipeline.state.enabled = False
+                return {"text": "Thanks for watching!", "confidence": 0.066}
+
+        class FakeTTS:
+            def available(self):
+                return True
+
+        voice_pipeline = VoicePipeline(
+            callback=lambda text: callbacks.append(text) or "You're welcome.",
+            stt_engine=FakeSTT(),
+            tts_engine=FakeTTS(),
+            language="en",
+            min_confidence=0.15,
+        )
+        voice_pipeline.state.enabled = True
+        monkeypatch.setattr(pipeline_module, "record_audio", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(voice_pipeline, "_speak", lambda text: spoken.append(text) or True)
+
+        voice_pipeline._run_loop()
+
+        assert callbacks == []
+        assert spoken == []
+        assert voice_pipeline.state.total_interactions == 0
+
+    def test_question_response_relistens_without_second_wake_word(self, monkeypatch):
+        from plugins.voice_stack import pipeline as pipeline_module
+        from plugins.voice_stack.pipeline import VoicePipeline
+
+        transcripts = iter(["TV4", "Yes"])
+        responses = iter([
+            "Do you want me to play TV4 on the TV?",
+            "Started TV4.",
+        ])
+        callbacks = []
+        spoken = []
+        beeps = []
+
+        class FakeWake:
+            calls = 0
+
+            def listen(self, timeout_seconds=5.0):
+                self.calls += 1
+                if self.calls == 1:
+                    return True
+                voice_pipeline.state.enabled = False
+                return False
+
+            def stop(self):
+                pass
+
+        class FakeSTT:
+            calls = 0
+
+            def available(self):
+                return True
+
+            def transcribe_with_confidence(self, _audio_path, language=None):
+                self.calls += 1
+                text = next(transcripts)
+                if self.calls == 2:
+                    voice_pipeline.state.enabled = False
+                return {"text": text, "confidence": 0.9}
+
+        class FakeTTS:
+            def available(self):
+                return True
+
+        wake = FakeWake()
+        voice_pipeline = VoicePipeline(
+            callback=lambda text: callbacks.append(text) or next(responses),
+            wake_word_engine=wake,
+            stt_engine=FakeSTT(),
+            tts_engine=FakeTTS(),
+            wake_cooldown=0,
+        )
+        voice_pipeline.state.enabled = True
+        monkeypatch.setattr(pipeline_module, "record_audio", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(pipeline_module, "_play_wake_beep", lambda: beeps.append(True))
+        monkeypatch.setattr(pipeline_module.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(voice_pipeline, "_speak", lambda text: spoken.append(text) or True)
+
+        voice_pipeline._run_loop()
+
+        assert wake.calls == 1
+        assert callbacks == ["TV4", "Yes"]
+        assert spoken == [
+            "Do you want me to play TV4 on the TV?",
+            "Started TV4.",
+        ]
+        assert len(beeps) == 2
+
+    def test_audio_playback_timeout_exceeds_generated_clip_duration(self, monkeypatch):
+        from plugins.voice_stack import pipeline
+
+        calls = []
+        monkeypatch.setattr(pipeline.os.path, "exists", lambda _path: True)
+        monkeypatch.setattr(
+            pipeline.shutil,
+            "which",
+            lambda player: f"/usr/bin/{player}" if player == "ffplay" else None,
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "_probe_audio_duration",
+            lambda _path: 30.96,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            pipeline.subprocess,
+            "run",
+            lambda command, **kwargs: calls.append((command, kwargs)),
+        )
+
+        assert pipeline.play_audio_local("answer.mp3") is True
+        assert calls[0][1]["timeout"] == pytest.approx(40.96)
+
+    def test_voice_config_sets_stt_language(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+
+        monkeypatch.setenv("HERMES_STT_LANGUAGE", "en")
+
+        assert voice_stack._get_config()["stt"]["language"] == "en"
+
+    def test_voice_config_sets_stt_tuning(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+
+        monkeypatch.setenv("HERMES_STT_INITIAL_PROMPT", "turn on CNN")
+        monkeypatch.setenv("HERMES_STT_HOTWORDS", "CNN, LCI, TF1")
+        monkeypatch.setenv("HERMES_STT_VAD", "true")
+        monkeypatch.setenv("HERMES_STT_MIN_CONFIDENCE", "0.15")
+
+        stt = voice_stack._get_config()["stt"]
+
+        assert stt["initial_prompt"] == "turn on CNN"
+        assert stt["hotwords"] == "CNN, LCI, TF1"
+        assert stt["vad_filter"] is True
+        assert stt["min_confidence"] == 0.15
+
+    def test_wake_beep_uses_hermes_audio_cue(self, monkeypatch):
+        from plugins.voice_stack import pipeline
+
+        calls = []
+        monkeypatch.setenv("HERMES_WAKE_BEEP_DURATION", "0.60")
+        monkeypatch.setattr(
+            pipeline.subprocess,
+            "run",
+            lambda command, **kwargs: calls.append((command, kwargs)),
+        )
+
+        pipeline._play_wake_beep()
+
+        command, kwargs = calls[0]
+        assert command[0] == "ffplay"
+        assert "sine=frequency=880:duration=0.60" in command
+        assert kwargs["env"]["SDL_AUDIODRIVER"] == "pulseaudio"
+        assert kwargs["timeout"] == 2
+
 
 class TestVoicePluginInit:
     """Voice plugin __init__.py smoke tests."""
@@ -828,6 +1277,32 @@ class TestVoicePluginInit:
         assert "HERMES_HA_WS_TOKEN" in data["config"]
         assert data["version"] == "0.0.12"
 
+    def test_register_auto_enables_voice_when_requested(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ws_receiver
+
+        calls = []
+
+        class FakeContext:
+            llm = object()
+
+            def register_tool(self, **kwargs):
+                return None
+
+        monkeypatch.setenv("HERMES_VOICE_AUTO_ENABLE", "true")
+        monkeypatch.setattr(voice_stack, "_init_engines", lambda: True)
+        monkeypatch.setattr(
+            voice_stack,
+            "_handle_voice_enable",
+            lambda args: calls.append(args) or json.dumps({"ok": True}),
+        )
+        monkeypatch.setattr(ws_receiver, "set_assist_query_handler", lambda handler: None)
+        monkeypatch.setattr(ws_receiver, "start_ws_receiver", lambda: None)
+
+        voice_stack.register(FakeContext())
+
+        assert calls == [{}]
+
 
 
 class TestVoiceWebSocketReceiver:
@@ -841,7 +1316,7 @@ class TestVoiceWebSocketReceiver:
             "state": "on",
         })
         assert result["ok"] is True
-        assert result["type"] == "ack"
+        assert result["type"] == "state_ack"
         assert result["entity_id"] == "light.kitchen"
 
     def test_unknown_message_type_errors(self):
@@ -1093,6 +1568,478 @@ class TestVoiceLifecycleRobustness:
         finally:
             voice_stack._pipeline = None
             voice_stack._voice_ready.clear()
+
+    def test_full_agent_fallback_runs_through_sessions_api(self, monkeypatch):
+        """The unmatched-query path uses the warm Sessions API, not a subprocess.
+
+        Spawning `hermes chat` per turn paid a full CLI cold start and forced
+        the child to be isolated from the parent's voice pipeline. Going
+        through the already-running API server removes both concerns, so this
+        asserts the new contract: the transcript and the voice system prompt
+        are handed to sessions_api.complete, and its result is returned as-is.
+        """
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import sessions_api
+
+        calls = []
+
+        def fake_complete(text, *, system_prompt=None, **kwargs):
+            calls.append({"text": text, "system_prompt": system_prompt})
+            return "It is sunny in Paris."
+
+        monkeypatch.setattr(sessions_api, "complete", fake_complete)
+        monkeypatch.setattr(sessions_api, "session_id", lambda: "voice-stack")
+
+        response = voice_stack._run_full_agent("What is the weather in Paris?")
+
+        assert response == "It is sunny in Paris."
+        assert len(calls) == 1
+        assert calls[0]["text"] == "What is the weather in Paris?"
+        assert "one or two concise plain sentences" in calls[0]["system_prompt"]
+        assert "markdown" in calls[0]["system_prompt"]
+
+    def test_full_agent_fallback_propagates_api_failure(self, monkeypatch):
+        """A dead API server must raise so the caller degrades to the raw LLM."""
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import sessions_api
+
+        def boom(text, **kwargs):
+            raise sessions_api.SessionsAPIUnavailable("API server unreachable")
+
+        monkeypatch.setattr(sessions_api, "complete", boom)
+
+        with pytest.raises(sessions_api.SessionsAPIUnavailable):
+            voice_stack._run_full_agent("What is the weather in Paris?")
+
+    def test_full_agent_fallback_rejects_empty_answer(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import sessions_api
+
+        monkeypatch.setattr(sessions_api, "complete", lambda text, **kwargs: "   ")
+        monkeypatch.setattr(sessions_api, "session_id", lambda: "voice-stack")
+
+        with pytest.raises(RuntimeError, match="no response"):
+            voice_stack._run_full_agent("What is the weather in Paris?")
+
+    def test_voice_transcript_routes_to_builtin_ha_agent_before_llm(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation as ha_assistant
+
+        calls = []
+
+        def fake_process(text, *, language, conversation_id, agent_id):
+            calls.append((text, language, conversation_id, agent_id))
+            return {
+                "response": {
+                    "response_type": "action_done",
+                    "speech": {"plain": {"speech": "Turned on the kitchen light"}},
+                },
+                "conversation_id": "ha-conv-1",
+            }
+
+        class FailingLlm:
+            def complete(self, **_kwargs):
+                raise AssertionError("Hermes LLM must not run for an HA-handled command")
+
+        class FakeContext:
+            llm = FailingLlm()
+
+        monkeypatch.setattr(ha_assistant, "process_conversation", fake_process, raising=False)
+
+        response = voice_stack._route_voice_transcript(
+            FakeContext(), "Turn on the kitchen light", language="en"
+        )
+
+        assert response == "Turned on the kitchen light"
+        assert calls == [
+            (
+                "Turn on the kitchen light",
+                "en",
+                None,
+                "conversation.home_assistant",
+            )
+        ]
+
+    def test_voice_transcript_retries_turn_on_as_run_for_ha_scripts(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        calls = []
+
+        def fake_process(text, **_kwargs):
+            calls.append(text)
+            if text == "turn on cnn":
+                return {
+                    "response": {
+                        "response_type": "error",
+                        "speech": {"plain": {"speech": "Unknown device"}},
+                        "data": {"code": "no_valid_targets"},
+                    }
+                }
+            return {
+                "response": {
+                    "response_type": "action_done",
+                    "speech": {"plain": {"speech": "Started"}},
+                    "data": {
+                        "success": [
+                            {"name": "CNN", "type": "entity", "id": "script.channel_cnn_us"}
+                        ],
+                        "failed": [],
+                    },
+                }
+            }
+
+        class FailingLlm:
+            def complete(self, **_kwargs):
+                raise AssertionError("Hermes LLM must not run after HA handles the retry")
+
+        class FakeContext:
+            llm = FailingLlm()
+
+        monkeypatch.setattr(ha_conversation, "process_conversation", fake_process)
+
+        response = voice_stack._route_voice_transcript(
+            FakeContext(), "turn on cnn", language="en"
+        )
+
+        assert calls == ["turn on cnn", "run cnn"]
+        assert response == "Started CNN."
+
+    def test_script_retry_expands_stt_digits_to_spoken_channel_name(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        calls = []
+
+        def fake_process(text, **_kwargs):
+            calls.append(text)
+            if text != "run France Three.":
+                return {
+                    "response": {
+                        "response_type": "error",
+                        "speech": {"plain": {"speech": "Unknown device"}},
+                        "data": {"code": "no_valid_targets"},
+                    }
+                }
+            return {
+                "response": {
+                    "response_type": "action_done",
+                    "speech": {"plain": {"speech": "Started"}},
+                    "data": {
+                        "success": [
+                            {
+                                "name": "France Three",
+                                "type": "entity",
+                                "id": "script.channel_france_3",
+                            }
+                        ],
+                        "failed": [],
+                    },
+                }
+            }
+
+        monkeypatch.setattr(ha_conversation, "process_conversation", fake_process)
+
+        response = voice_stack._route_voice_transcript(
+            object(), "Turn on France 3.", language="en"
+        )
+
+        assert calls == [
+            "Turn on France 3.",
+            "run France 3.",
+            "run France Three.",
+        ]
+        assert response == "Started France Three."
+
+    def test_live_channel_selector_ignores_stale_entities_and_normalizes_names(self):
+        from plugins.voice_stack.ha_conversation import select_live_channel
+
+        states = [
+            {
+                "entity_id": "script.channel_tf1",
+                "state": "unavailable",
+                "attributes": {"friendly_name": "TF1"},
+            },
+            {
+                "entity_id": "script.channel_tf_1",
+                "state": "off",
+                "attributes": {"friendly_name": "TF ONE"},
+            },
+            {
+                "entity_id": "script.channel_tv_4_sweden",
+                "state": "off",
+                "attributes": {"friendly_name": "TV 4"},
+            },
+            {
+                "entity_id": "script.channel_france_2",
+                "state": "off",
+                "attributes": {"friendly_name": "France Two"},
+            },
+        ]
+
+        assert select_live_channel(states, "TF1")["entity_id"] == "script.channel_tf_1"
+        assert select_live_channel(states, "TV4.")["entity_id"] == "script.channel_tv_4_sweden"
+        assert select_live_channel(states, "France 2")["entity_id"] == "script.channel_france_2"
+
+    def test_no_target_uses_verified_live_channel_instead_of_cached_assist_name(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "speech": {"plain": {"speech": "Unknown device"}},
+                    "data": {"code": "no_valid_targets"},
+                }
+            },
+        )
+        calls = []
+        monkeypatch.setattr(
+            ha_conversation,
+            "run_live_channel",
+            lambda target: calls.append(target) or {
+                "ok": True,
+                "entity_id": "script.channel_tv_4_sweden",
+                "name": "TV 4",
+                "media_title": "Nyheterna",
+            },
+        )
+
+        response = voice_stack._route_voice_transcript(
+            object(), "Turn on TV4.", language="en"
+        )
+
+        assert calls == ["TV4."]
+        assert response == "Started TV 4."
+
+    def test_live_channel_verification_failure_is_reported_honestly(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "speech": {"plain": {"speech": "Unknown device"}},
+                    "data": {"code": "no_valid_targets"},
+                }
+            },
+        )
+        monkeypatch.setattr(
+            ha_conversation,
+            "run_live_channel",
+            lambda _target: {
+                "ok": False,
+                "reason": "verification_failed",
+                "name": "TV 4",
+                "entity_id": "script.channel_tv_4_sweden",
+            },
+        )
+
+        response = voice_stack._route_voice_transcript(
+            object(), "Turn on TV4.", language="en"
+        )
+
+        assert response == "I found TV 4, but the channel did not switch."
+
+    def test_rejected_device_command_does_not_fall_back_to_agent_guessing(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        calls = []
+
+        def reject(text, **_kwargs):
+            calls.append(text)
+            return {
+                "response": {
+                    "response_type": "error",
+                    "speech": {"plain": {"speech": "I could not find that device."}},
+                    "data": {"code": "no_valid_targets"},
+                }
+            }
+
+        monkeypatch.setattr(ha_conversation, "process_conversation", reject)
+        monkeypatch.setattr(
+            voice_stack,
+            "_run_full_agent",
+            lambda _text: (_ for _ in ()).throw(
+                AssertionError("Device commands must not be guessed by the full agent")
+            ),
+        )
+
+        response = voice_stack._route_voice_transcript(
+            object(), "turn on mystery TV", language="en"
+        )
+
+        assert calls == ["turn on mystery TV", "run mystery TV"]
+        assert response == "I could not find that device."
+
+    def test_voice_transcript_falls_back_to_hermes_only_when_ha_cannot_match(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation as ha_assistant
+
+        class FailingLlm:
+            def complete(self, **_kwargs):
+                raise AssertionError("Raw LLM must not replace the tool-capable agent")
+
+        class FakeContext:
+            llm = FailingLlm()
+
+        monkeypatch.setattr(
+            ha_assistant,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "speech": {"plain": {"speech": "Sorry, I couldn't understand that"}},
+                }
+            },
+            raising=False,
+        )
+        monkeypatch.setattr(
+            voice_stack,
+            "_run_full_agent",
+            lambda text: f"Tool-capable answer for: {text}",
+        )
+        ctx = FakeContext()
+
+        response = voice_stack._route_voice_transcript(ctx, "Tell me something clever", language="en")
+
+        assert response == "Tool-capable answer for: Tell me something clever"
+
+    def test_alpharunner_question_routes_to_sportscoach_profile(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "speech": {"plain": {"speech": "Sorry, I couldn't understand that"}},
+                }
+            },
+        )
+        calls = []
+
+        def fake_run(text, *, profile=None):
+            calls.append((text, profile))
+            return "Your fastest run was five kilometres in twenty minutes."
+
+        monkeypatch.setattr(voice_stack, "_run_full_agent", fake_run)
+
+        response = voice_stack._route_voice_transcript(
+            object(), "What is my fastest run according to alpha run?", language="en"
+        )
+
+        assert response == "Your fastest run was five kilometres in twenty minutes."
+        assert calls == [
+            ("What is my fastest run according to alpha run?", "sportscoach")
+        ]
+
+    def test_profile_api_failure_does_not_fall_back_to_contextless_llm(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import sessions_api
+
+        monkeypatch.setattr(
+            voice_stack,
+            "_run_full_agent",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                sessions_api.SessionsAPIUnavailable("sportscoach API is down")
+            ),
+        )
+
+        class FailingLlm:
+            def complete(self, **_kwargs):
+                raise AssertionError("Profile-owned requests must not use the raw LLM")
+
+        class FakeContext:
+            llm = FailingLlm()
+
+        response = voice_stack._complete_voice_with_hermes(
+            FakeContext(), "What was my fastest run last week?"
+        )
+
+        assert response == "Sports Coach is unavailable right now."
+
+    def test_voice_enable_routes_transcript_through_home_assistant(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation as ha_assistant
+
+        class FakeResult:
+            text = "The actual Hermes response."
+
+        class FakeLlm:
+            def __init__(self):
+                self.calls = []
+
+            def complete(self, messages, **kwargs):
+                self.calls.append((messages, kwargs))
+                return FakeResult()
+
+        class FakeContext:
+            def __init__(self):
+                self.llm = FakeLlm()
+
+        class FakeState:
+            enabled = False
+
+            def to_dict(self):
+                return {"enabled": self.enabled}
+
+        class FakePipeline:
+            instance = None
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.state = FakeState()
+                self.available = True
+                FakePipeline.instance = self
+
+            def start(self):
+                self.state.enabled = True
+                return True
+
+            def stop(self):
+                self.state.enabled = False
+
+        ctx = FakeContext()
+        monkeypatch.setattr(
+            ha_assistant,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "action_done",
+                    "speech": {"plain": {"speech": "Turned on the kitchen light"}},
+                }
+            },
+        )
+        monkeypatch.setattr("plugins.voice_stack.pipeline.VoicePipeline", FakePipeline)
+        monkeypatch.setattr(voice_stack, "_ensure_voice_ready", lambda: True)
+        monkeypatch.setattr(voice_stack, "_wake_word_engine", object())
+        monkeypatch.setattr(voice_stack, "_stt_engine", object())
+        monkeypatch.setattr(voice_stack, "_tts_engine", object())
+        monkeypatch.setattr(voice_stack, "_plugin_ctx", ctx, raising=False)
+        voice_stack._voice_ready.set()
+        voice_stack._pipeline = None
+
+        try:
+            enabled = json.loads(voice_stack._handle_voice_enable({}))
+            assert FakePipeline.instance is not None
+            response = FakePipeline.instance.kwargs["callback"]("Turn on the kitchen light")
+        finally:
+            voice_stack._pipeline = None
+            voice_stack._voice_ready.clear()
+
+        assert enabled["ok"] is True
+        assert response == "Turned on the kitchen light"
+        assert ctx.llm.calls == []
 
     def test_voice_listen_creates_cache_dir_and_returns_no_speech_category(self, monkeypatch, tmp_path):
         import plugins.voice_stack as voice_stack

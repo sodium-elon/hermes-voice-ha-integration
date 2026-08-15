@@ -27,6 +27,10 @@ config:
     type: str
     default: ""
     description: Optional bearer token for HA WebSocket clients; falls back to API_SERVER_KEY/HERMES_API_KEY
+  HERMES_VOICE_AUTO_ENABLE:
+    type: bool
+    default: false
+    description: Start continuous wake-word listening when the plugin loads
 
   # Wake Word engine: porcupine, openwakeword, command
   HERMES_WAKE_WORD_ENGINE:
@@ -37,6 +41,26 @@ config:
     type: str
     default: computer
     description: Wake word keyword
+  HERMES_WAKE_WORD_MODEL:
+    type: str
+    default: ""
+    description: Comma-separated custom OpenWakeWord .tflite or .onnx model paths
+  HERMES_WAKE_WORD_THRESHOLD:
+    type: float
+    default: 0.55
+    description: Detection score threshold for OpenWakeWord (real wakes score 0.95+; 0.55 sits above the model's 0.5 training point)
+  HERMES_WAKE_VAD_THRESHOLD:
+    type: float
+    default: 0.5
+    description: Silero VAD gate on wake predictions (0 disables); blocks non-speech triggers like music and room noise
+  HERMES_WAKE_COOLDOWN:
+    type: float
+    default: 5.0
+    description: Refractory period in seconds after TTS playback ends before wake-word detection resumes; stops the assistant rewaking on its own voice
+  HERMES_WAKE_BEEP_DURATION:
+    type: float
+    default: 0.60
+    description: Wake cue duration in seconds; HDMI outputs may swallow very short tones
 
   # STT engine: faster-whisper, whisper-cpp, command
   HERMES_STT_ENGINE:
@@ -46,11 +70,43 @@ config:
   HERMES_STT_MODEL:
     type: str
     default: tiny
-    description: STT model size (tiny, base, small, medium, large-v3)
-  HERMES_STT_CONFIDENCE:
+    description: STT model size (tiny, base, small, small.en, medium, large-v3)
+  HERMES_STT_LANGUAGE:
+    type: str
+    default: en
+    description: Language code pinned for continuous voice transcription and HA conversation routing
+  HERMES_STT_INITIAL_PROMPT:
+    type: str
+    default: ""
+    description: Sentence examples used to bias Whisper toward local Home Assistant commands
+  HERMES_STT_HOTWORDS:
+    type: str
+    default: ""
+    description: Comma-separated local entity, channel, app, and room names
+  HERMES_STT_VAD:
+    type: bool
+    default: true
+    description: Use Faster-Whisper voice activity detection to suppress non-speech audio
+  HERMES_STT_MIN_CONFIDENCE:
     type: float
-    default: 0.70
-    description: Minimum confidence threshold for voice input acceptance
+    default: 0.15
+    description: Silently discard hallucinated transcripts below this confidence floor
+  HERMES_STT_CONDITION_ON_PREVIOUS_TEXT:
+    type: bool
+    default: false
+    description: Let earlier segments bias later ones; keep false to stop hallucination loops
+  HERMES_STT_NO_SPEECH_THRESHOLD:
+    type: float
+    default: 0
+    description: Whisper no_speech gate (0 = engine default); raise toward 0.6 to reject non-speech harder
+  HERMES_STT_LOG_PROB_THRESHOLD:
+    type: float
+    default: 0
+    description: Whisper avg-logprob gate (0 = engine default); -1.0 rejects uncertain decodes
+  HERMES_SPEECH_THRESHOLD:
+    type: float
+    default: 0.005
+    description: Recorder RMS floor; keep low and let VAD classify speech
 
   # TTS engine: edge, piper, command
   HERMES_TTS_ENGINE:
@@ -77,6 +133,35 @@ config:
     type: float
     default: 2.0
     description: Seconds of silence before ending recording
+
+  # Tool-capable fallback: runs through the gateway's api_server platform
+  # instead of spawning a `hermes chat` subprocess per turn.
+  HERMES_API_BASE_URL:
+    type: str
+    default: http://127.0.0.1:8642
+    description: Hermes API server base URL (gateway api_server platform)
+  HERMES_VOICE_SESSION_ID:
+    type: str
+    default: voice-stack
+    description: Session id the voice fallback reuses across turns
+  HERMES_VOICE_AGENT_TIMEOUT:
+    type: float
+    default: 180.0
+    description: Read timeout in seconds for a streamed agent turn
+
+  # Debug event stream (read by `hermes-voice-monitor`)
+  HERMES_VOICE_EVENTS:
+    type: bool
+    default: true
+    description: Append one JSON line per pipeline stage (wake/heard/route/reply/spoken)
+  HERMES_VOICE_EVENT_LOG:
+    type: str
+    default: ~/.hermes/logs/voice_events.jsonl
+    description: Destination for the voice event stream
+  HERMES_VOICE_EVENT_MAX_BYTES:
+    type: int
+    default: 5242880
+    description: Rotate the event stream to .1 once it exceeds this size
 
   # Audio cache
   HERMES_VOICE_CACHE:

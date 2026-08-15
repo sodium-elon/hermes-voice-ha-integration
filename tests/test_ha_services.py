@@ -66,6 +66,7 @@ def _install_homeassistant_stubs() -> None:
 _install_homeassistant_stubs()
 
 from custom_components.hermes.const import DOMAIN, normalize_wake_word
+from custom_components.hermes import frontend as hermes_frontend
 from custom_components.hermes import services as hermes_services
 
 
@@ -159,6 +160,23 @@ class FakeBridge:
 )
 def test_normalize_wake_word(value: object, expected: list[str]) -> None:
     assert normalize_wake_word(value) == expected
+
+
+@pytest.mark.asyncio
+async def test_frontend_resource_registration_is_idempotent() -> None:
+    class FakeHttp:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def async_register_static_paths(self, configs: list[Any]) -> None:
+            self.calls += 1
+
+    hass = SimpleNamespace(http=FakeHttp(), data={})
+
+    await hermes_frontend.async_register_resources(hass)
+    await hermes_frontend.async_register_resources(hass)
+
+    assert hass.http.calls == 1
 
 
 def test_target_builder_merges_entity_area_device_and_explicit_target() -> None:

@@ -16,6 +16,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .. import events
+
 logger = logging.getLogger(__name__)
 
 
@@ -115,6 +117,12 @@ class PorcupineEngine(WakeWordEngine):
                 keyword_index = self._porcupine.process(pcm)
                 if keyword_index >= 0:
                     logger.info("Wake word detected: %s", self._keywords[keyword_index])
+                    events.begin_turn()
+                    events.emit(
+                        "wake",
+                        engine="porcupine",
+                        word=self._keywords[keyword_index],
+                    )
                     return True
 
             return False
@@ -167,8 +175,18 @@ class OpenWakeWordEngine(WakeWordEngine):
     chunks for wake word activation.
     """
 
-    def __init__(self, model_paths: Optional[List[str]] = None) -> None:
+    def __init__(
+        self,
+        model_paths: Optional[List[str]] = None,
+        threshold: float = 0.5,
+        vad_threshold: Optional[float] = None,
+    ) -> None:
         self._model_paths = model_paths or []
+        self._threshold = threshold
+        # Silero VAD gate (bundled with openwakeword): predictions only count
+        # while speech is present. Calibrated 2026-08-15: real wake clips keep
+        # max score 0.99 with vad_threshold=0.5 while ambient TV drops to 0.0.
+        self._vad_threshold = vad_threshold
         self._models: List[Any] = []
         self._audio_stream = None
         self._stop = False
@@ -188,25 +206,41 @@ class OpenWakeWordEngine(WakeWordEngine):
         import time
         from openwakeword.model import Model
 
-        if not self._model_paths:
-            # Use built-in pre-trained models that ship with openwakeword
-            self._models = [Model(wakeword_models=["alexa"])]
-        else:
-            self._models = [Model(wakeword_models=p) for p in self._model_paths]
+        if not self._models:
+            if not self._model_paths:
+                # Use built-in pre-trained models that ship with openwakeword
+                self._models = [Model(wakeword_models=["alexa"], vad_threshold=self._vad_threshold)]
+            else:
+                self._models = [
+                    Model(
+                        wakeword_models=[path],
+                        inference_framework="onnx" if Path(path).suffix.lower() == ".onnx" else "tflite",
+                        vad_threshold=self._vad_threshold,
+                    )
+                    for path in self._model_paths
+                ]
 
-        self._audio = pyaudio.PyAudio()
+        # A fresh listen session starts a fresh audio stream; drop any
+        # melspectrogram features left over from the previous turn so the
+        # TTS reply we just played cannot bleed into these predictions.
+        for model in self._models:
+            reset = getattr(model, "reset", None)
+            if callable(reset):
+                reset()
+
+        if self._audio_stream is None:
+            self._audio = pyaudio.PyAudio()
+            self._audio_stream = self._audio.open(
+                rate=16000,
+                channels=1,
+                format=pyaudio.paInt16,
+                input=True,
+                frames_per_buffer=1280,
+            )
         self._stop = False
         chunk_rate = 16000
 
         try:
-            self._audio_stream = self._audio.open(
-                rate=chunk_rate,
-                channels=1,
-                format=pyaudio.paInt16,
-                input=True,
-                frames_per_buffer=1280,  # 80ms chunks at 16kHz
-            )
-
             start = time.monotonic()
             while not self._stop:
                 if time.monotonic() - start > timeout_seconds:
@@ -217,13 +251,26 @@ class OpenWakeWordEngine(WakeWordEngine):
                 for model in self._models:
                     predictions = model.predict(pcm)
                     for wake_word, score in predictions.items():
-                        if score > 0.5:
+                        if score > self._threshold:
                             logger.info("Wake word '%s' detected (score: %.2f)", wake_word, score)
+                            events.begin_turn()
+                            events.emit(
+                                "wake",
+                                engine="openwakeword",
+                                word=wake_word,
+                                score=round(float(score), 3),
+                                threshold=self._threshold,
+                            )
+                            self._cleanup()
                             return True
 
             return False
-        finally:
+        except Exception:
             self._cleanup()
+            raise
+        finally:
+            if self._stop:
+                self._cleanup()
 
     def stop(self) -> None:
         self._stop = True
@@ -299,7 +346,15 @@ def create_wake_word_engine(engine_type: str = "porcupine", **kwargs: Any) -> Wa
             sensitivities=kwargs.get("sensitivities"),
         )
     elif engine_type == "openwakeword":
-        return OpenWakeWordEngine(model_paths=kwargs.get("model_paths"))
+        return OpenWakeWordEngine(
+            model_paths=kwargs.get("model_paths"),
+            threshold=float(kwargs.get("threshold", 0.5)),
+            vad_threshold=(
+                float(kwargs["vad_threshold"])
+                if kwargs.get("vad_threshold") not in (None, 0, "")
+                else None
+            ),
+        )
     elif engine_type == "command":
         return CommandWWEngine(command=kwargs.get("command", ["false"]))
     else:

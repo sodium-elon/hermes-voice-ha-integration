@@ -16,8 +16,11 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from . import events, sessions_api
 
 logger = logging.getLogger(__name__)
 
@@ -32,18 +35,42 @@ _voice_ready = threading.Event()
 _wake_word_engine: Optional[Any] = None
 _stt_engine: Optional[Any] = None
 _tts_engine: Optional[Any] = None
+_plugin_ctx: Optional[Any] = None
 
 
 def _get_config() -> Dict[str, Any]:
     """Load voice stack config from plugin.yaml or env."""
+    wake_word_model_paths = [
+        path.strip()
+        for path in os.getenv("HERMES_WAKE_WORD_MODEL", "").split(",")
+        if path.strip()
+    ]
     return {
         "wake_word": {
             "engine": os.getenv("HERMES_WAKE_WORD_ENGINE", "porcupine"),
             "keyword": os.getenv("HERMES_WAKE_WORD", "computer"),
+            "model_paths": wake_word_model_paths,
+            "threshold": float(os.getenv("HERMES_WAKE_WORD_THRESHOLD", "0.55")),
+            # Silero VAD gate on wake predictions: 0 disables, 0.5 blocks
+            # non-speech triggers (calibrated 2026-08-15).
+            "vad_threshold": float(v) if (v := os.getenv("HERMES_WAKE_VAD_THRESHOLD", "0.5").strip()) else None,
+            "cooldown": float(os.getenv("HERMES_WAKE_COOLDOWN", "5.0")),
         },
         "stt": {
             "engine": os.getenv("HERMES_STT_ENGINE", "faster-whisper"),
             "model_size": os.getenv("HERMES_STT_MODEL", "tiny"),
+            "language": os.getenv("HERMES_STT_LANGUAGE", "en").strip() or "en",
+            "initial_prompt": os.getenv("HERMES_STT_INITIAL_PROMPT", "").strip() or None,
+            "hotwords": os.getenv("HERMES_STT_HOTWORDS", "").strip() or None,
+            "vad_filter": os.getenv("HERMES_STT_VAD", "true").strip().lower()
+            in {"1", "true", "yes", "on"},
+            "min_confidence": float(os.getenv("HERMES_STT_MIN_CONFIDENCE", "0.15")),
+            "speech_threshold": float(os.getenv("HERMES_SPEECH_THRESHOLD", "0.005")),
+            "condition_on_previous_text": os.getenv(
+                "HERMES_STT_CONDITION_ON_PREVIOUS_TEXT", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"},
+            "no_speech_threshold": float(v) if (v := os.getenv("HERMES_STT_NO_SPEECH_THRESHOLD", "").strip()) else None,
+            "log_prob_threshold": float(v) if (v := os.getenv("HERMES_STT_LOG_PROB_THRESHOLD", "").strip()) else None,
         },
         "tts": {
             "engine": os.getenv("HERMES_TTS_ENGINE", "edge"),
@@ -52,7 +79,6 @@ def _get_config() -> Dict[str, Any]:
         "media_player_entity": os.getenv("HERMES_MEDIA_PLAYER", ""),
         "max_record_duration": float(os.getenv("HERMES_RECORD_DURATION", "10")),
         "silence_timeout": float(os.getenv("HERMES_SILENCE_TIMEOUT", "2.0")),
-        "confidence_threshold": float(os.getenv("HERMES_STT_CONFIDENCE", "0.70")),
     }
 
 
@@ -78,6 +104,12 @@ def _init_engines() -> bool:
         _stt_engine = create_stt_engine(
             engine_type=config["stt"]["engine"],
             model_size=config["stt"].get("model_size", "tiny"),
+            initial_prompt=config["stt"].get("initial_prompt"),
+            hotwords=config["stt"].get("hotwords"),
+            vad_filter=config["stt"].get("vad_filter", True),
+            condition_on_previous_text=config["stt"].get("condition_on_previous_text", False),
+            no_speech_threshold=config["stt"].get("no_speech_threshold"),
+            log_prob_threshold=config["stt"].get("log_prob_threshold"),
         )
     except Exception as exc:
         logger.warning("STT engine init failed: %s", exc)
@@ -89,6 +121,9 @@ def _init_engines() -> bool:
         _wake_word_engine = create_wake_word_engine(
             engine_type=config["wake_word"]["engine"],
             keywords=[config["wake_word"]["keyword"]],
+            model_paths=config["wake_word"]["model_paths"],
+            threshold=config["wake_word"]["threshold"],
+            vad_threshold=config["wake_word"].get("vad_threshold"),
         )
     except Exception as exc:
         logger.warning("Wake word engine init failed: %s", exc)
@@ -159,6 +194,272 @@ def _handle_voice_status(args: dict, **kw) -> str:
     return json.dumps(result, default=str)
 
 
+VOICE_AGENT_SYSTEM_PROMPT = (
+    "You are Hermes, answering a local wake-word voice request. "
+    "Respond in one or two concise plain sentences suitable for speech. "
+    "Do not use markdown, lists, URLs, or file paths. "
+    "Use web or Home Assistant tools when they are needed to answer."
+)
+
+
+def _run_full_agent(text: str, *, profile: Optional[str] = None) -> str:
+    """Run one tool-capable Hermes turn for an unmatched voice query.
+
+    Goes through the gateway's API-server platform rather than spawning a
+    `hermes chat` subprocess: the agent is already warm, so this skips the
+    per-turn CLI cold start, and the SSE stream reports tool calls live
+    instead of leaving them to be scraped back out of agent.log.
+    """
+    started = time.monotonic()
+    try:
+        response = sessions_api.complete(
+            text,
+            profile=profile,
+            system_prompt=VOICE_AGENT_SYSTEM_PROMPT,
+        )
+    except Exception:
+        events.emit(
+            "agent",
+            runner="sessions api",
+            ok=False,
+            seconds=round(time.monotonic() - started, 2),
+        )
+        raise
+
+    events.emit(
+        "agent",
+        runner="sessions api",
+        ok=True,
+        profile=profile,
+        session=sessions_api.session_id(),
+        seconds=round(time.monotonic() - started, 2),
+    )
+
+    response = (response or "").strip()
+    if not response:
+        raise RuntimeError("Hermes voice agent returned no response")
+    return response
+
+
+def _complete_voice_with_hermes(ctx: Any, text: str) -> str:
+    """Run the full tool-capable agent, degrading to raw LLM only on failure."""
+    profile = _voice_profile_for(text)
+    try:
+        if profile:
+            return _run_full_agent(text, profile=profile)
+        return _run_full_agent(text)
+    except Exception as exc:
+        if profile:
+            logger.warning("Profile voice agent %s failed: %s", profile, exc)
+            display_name = {"sportscoach": "Sports Coach"}.get(profile, profile)
+            return f"{display_name} is unavailable right now."
+        logger.warning("Tool-capable voice fallback failed; using raw LLM: %s", exc)
+
+    result = ctx.llm.complete(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are Hermes, responding to a local wake-word voice request. "
+                    "Reply naturally and concisely for text-to-speech. "
+                    "If the request needs unavailable context, ask one brief clarification."
+                ),
+            },
+            {"role": "user", "content": text},
+        ],
+        max_tokens=512,
+        temperature=0.2,
+        purpose="voice_stack.wake_word",
+    )
+    return (result.text or "").strip()
+
+
+def _voice_profile_for(text: str) -> Optional[str]:
+    """Route personal running-data questions to the profile that owns them."""
+    import re
+
+    if re.search(
+        r"\b(?:alpha\s*runner|alpha\s+run|garmin|run(?:ning)?\s+(?:stats?|data|history|record|progress)|fastest\s+run|personal\s+best|\bpb\b)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return "sportscoach"
+    return None
+
+
+def _route_voice_transcript(ctx: Any, text: str, *, language: str = "en") -> str:
+    """Let native HA execute commands; use Hermes only for unmatched conversation."""
+    from . import ha_conversation
+
+    result = ha_conversation.process_conversation(
+        text,
+        language=language,
+        conversation_id=None,
+        agent_id="conversation.home_assistant",
+    )
+    if result.get("error"):
+        logger.warning("Home Assistant voice routing failed: %s", result["error"])
+        events.emit("route", target="home_assistant", outcome="unavailable", detail=result["error"])
+        return "Home Assistant is unavailable right now."
+
+    response = result.get("response") or {}
+    response_type = str(response.get("response_type") or "").lower()
+    speech = (
+        ((response.get("speech") or {}).get("plain") or {}).get("speech") or ""
+    ).strip()
+
+    if response_type != "error":
+        events.emit(
+            "route",
+            target="home_assistant",
+            outcome="handled",
+            response_type=response_type,
+            targets=_intent_targets(response),
+        )
+        return speech or "Done."
+
+    data = response.get("data") or {}
+    import re
+
+    channel_target = None
+    channel_command = re.fullmatch(
+        r"\s*(?:(?:turn|switch)\s+on|play|run|start|activate)\s+(.+?)\s*",
+        text,
+        re.IGNORECASE,
+    )
+    if channel_command:
+        channel_target = channel_command.group(1)
+    elif len(re.findall(r"[A-Za-z0-9]+", text)) <= 3:
+        channel_target = text.strip()
+
+    if channel_target:
+        live_channel = ha_conversation.run_live_channel(channel_target)
+        if live_channel.get("ok"):
+            events.emit(
+                "route",
+                target="home_assistant",
+                outcome="handled_live_channel",
+                targets=[live_channel.get("entity_id")],
+                media_title=live_channel.get("media_title"),
+            )
+            return f"Started {live_channel['name']}."
+        if live_channel.get("reason") == "verification_failed":
+            name = live_channel.get("name") or channel_target
+            events.emit(
+                "route",
+                target="home_assistant",
+                outcome="channel_verification_failed",
+                targets=[live_channel.get("entity_id")],
+            )
+            return f"I found {name}, but the channel did not switch."
+
+    if data.get("code") == "no_valid_targets":
+
+        match = re.fullmatch(r"\s*(?:turn|switch)\s+on\s+(.+?)\s*", text, re.IGNORECASE)
+        if match:
+            script_name = match.group(1)
+            retry_text = f"run {script_name}"
+            retry = ha_conversation.process_conversation(
+                retry_text,
+                language=language,
+                conversation_id=None,
+                agent_id="conversation.home_assistant",
+            )
+            retry_response = retry.get("response") or {}
+            if str(retry_response.get("response_type") or "").lower() == "error":
+                number_words = {
+                    "0": "Zero",
+                    "1": "One",
+                    "2": "Two",
+                    "3": "Three",
+                    "4": "Four",
+                    "5": "Five",
+                    "6": "Six",
+                    "7": "Seven",
+                    "8": "Eight",
+                    "9": "Nine",
+                }
+                spoken_name = re.sub(
+                    r"\b[0-9]\b",
+                    lambda number: number_words[number.group(0)],
+                    script_name,
+                )
+                if spoken_name != script_name:
+                    retry_text = f"run {spoken_name}"
+                    retry = ha_conversation.process_conversation(
+                        retry_text,
+                        language=language,
+                        conversation_id=None,
+                        agent_id="conversation.home_assistant",
+                    )
+                    retry_response = retry.get("response") or {}
+            if str(retry_response.get("response_type") or "").lower() != "error":
+                successes = ((retry_response.get("data") or {}).get("success") or [])
+                script_target = next(
+                    (
+                        target
+                        for target in successes
+                        if str(target.get("id") or "").startswith("script.")
+                    ),
+                    None,
+                )
+                events.emit(
+                    "route",
+                    target="home_assistant",
+                    outcome="handled_after_script_retry",
+                    retried_as=retry_text,
+                    targets=_intent_targets(retry_response),
+                )
+                if script_target and script_target.get("name"):
+                    return f"Started {script_target['name']}."
+                retry_speech = (
+                    ((retry_response.get("speech") or {}).get("plain") or {}).get("speech")
+                    or ""
+                ).strip()
+                return retry_speech or "Done."
+
+    import re
+
+    if re.match(
+        r"^\s*(?:turn|switch|power|start|stop|open|close|lock|unlock|set|dim|brighten|play|pause|mute|unmute)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        events.emit(
+            "route",
+            target="home_assistant",
+            outcome="no_match",
+            response_type=response_type,
+            code=data.get("code"),
+            detail="command verb held in HA; not escalated to Hermes",
+        )
+        return speech or "Home Assistant could not find a matching device."
+
+    events.emit(
+        "route",
+        target="hermes",
+        outcome="escalated",
+        response_type=response_type,
+        code=data.get("code"),
+    )
+    return _complete_voice_with_hermes(ctx, text)
+
+
+def _intent_targets(response: dict) -> list:
+    """Extract the entity ids a Home Assistant intent acted on, for monitoring."""
+    try:
+        data = response.get("data") or {}
+        targets = []
+        for bucket in ("success", "targets", "failed"):
+            for item in data.get(bucket) or []:
+                entity_id = str((item or {}).get("id") or "").strip()
+                if entity_id and entity_id not in targets:
+                    targets.append(entity_id)
+        return targets[:12]
+    except Exception:  # pragma: no cover - monitoring must never break voice
+        return []
+
+
 def _handle_voice_enable(args: dict, **kw) -> str:
     """Enable continuous voice mode with wake word and HA media_player."""
     global _pipeline
@@ -179,25 +480,16 @@ def _handle_voice_enable(args: dict, **kw) -> str:
 
         from .pipeline import VoicePipeline
 
-        # Define the callback that sends user text to Hermes
-        # In production this is wired by the Hermes tool dispatch system.
-        # For now, the callback uses the HA tool bridge directly.
+        # Define the callback that sends user text through Hermes's supported
+        # plugin LLM facade. The pipeline runs in a background thread, so use
+        # the synchronous facade rather than the async Assist receiver path.
         def _voice_callback(text: str) -> str:
-            """Called when STT produces text. This is where Hermes processes it."""
+            """Route STT text through native HA before Hermes conversation."""
             logger.info("Voice callback received: %s", text)
-            try:
-                from ..home_assistant.ha_assistant import (
-                    search_entities,
-                    call_service,
-                )
-            except ImportError:
-                return "The Home Assistant bridge is not available."
-            # For P1, delegate the actual LLM processing to the Hermes agent
-            # via a registered hook. The response here is a placeholder —
-            # the Hermes agent loop handles full NLU.
-            return (
-                f"I heard: {text}. "
-                "Voice processing is active — Hermes is listening."
+            if _plugin_ctx is None:
+                return "Hermes voice processing is unavailable."
+            return _route_voice_transcript(
+                _plugin_ctx, text, language=config["stt"]["language"]
             )
 
         _pipeline = VoicePipeline(
@@ -208,7 +500,10 @@ def _handle_voice_enable(args: dict, **kw) -> str:
             media_player_entity=media_player,
             max_record_duration=config["max_record_duration"],
             silence_timeout=config["silence_timeout"],
-            confidence_threshold=config["confidence_threshold"],
+            speech_threshold=config["stt"]["speech_threshold"],
+            language=config["stt"]["language"],
+            min_confidence=config["stt"]["min_confidence"],
+            wake_cooldown=config["wake_word"].get("cooldown", 5.0),
         )
 
         if not _pipeline.available:
@@ -485,6 +780,9 @@ def register(ctx) -> None:
     return descriptive errors rather than being hidden, so users can see
     what's missing via voice_status.
     """
+    global _plugin_ctx
+    _plugin_ctx = ctx
+
     for name, schema, handler, emoji in _TOOLS:
         ctx.register_tool(
             name=name,
@@ -504,5 +802,15 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.warning("Hermes HA WebSocket receiver did not start: %s", exc)
 
-    # Run availability check in background so voice_status is accurate
-    _init_engines()
+    # Initialise engine state so voice_status is accurate. Long-running hosts
+    # such as the Hermes gateway may opt into immediate background listening;
+    # interactive CLI sessions leave this unset to avoid microphone contention.
+    engines_ready = _init_engines()
+    if (
+        engines_ready
+        and os.getenv("HERMES_VOICE_AUTO_ENABLE", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        result = json.loads(_handle_voice_enable({}))
+        if not result.get("ok"):
+            logger.warning("Voice pipeline auto-enable failed: %s", result.get("error", result))

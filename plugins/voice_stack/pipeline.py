@@ -25,15 +25,59 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from . import events
+
 logger = logging.getLogger(__name__)
 
 
 class VoiceRecordingError(RuntimeError):
     """Raised when microphone capture fails before speech classification."""
 
+
+def _play_wake_beep() -> None:
+    """Play a best-effort local cue after wake-word detection."""
+    try:
+        try:
+            duration = float(os.getenv("HERMES_WAKE_BEEP_DURATION", "0.60"))
+        except ValueError:
+            duration = 0.60
+        duration = min(max(duration, 0.10), 1.50)
+        subprocess.run(
+            [
+                "ffplay",
+                "-nodisp",
+                "-autoexit",
+                "-loglevel",
+                "quiet",
+                "-f",
+                "lavfi",
+                "-i",
+                f"sine=frequency=880:duration={duration:.2f}",
+            ],
+            capture_output=True,
+            timeout=2,
+            check=False,
+            env={**os.environ, "SDL_AUDIODRIVER": "pulseaudio"},
+        )
+    except Exception as exc:
+        logger.debug("Wake beep unavailable: %s", exc)
+
 # ---------------------------------------------------------------------------
 # Audio recording helper
 # ---------------------------------------------------------------------------
+
+
+def _float_audio_to_pcm16(audio: Any) -> Any:
+    """Convert float audio to PCM16 without over-range integer wraparound."""
+    import numpy as np
+
+    samples = np.asarray(audio, dtype=np.float32)
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    if peak > 0.98:
+        samples = samples * (0.98 / peak)
+    samples = np.clip(samples, -1.0, 1.0)
+    return np.rint(samples * 32767.0).astype(np.int16)
+
 
 def record_audio(
     output_path: str,
@@ -70,6 +114,12 @@ def record_audio(
         rms = np.sqrt(np.mean(audio_data ** 2))
         if rms < silence_threshold:
             logger.debug("Audio too quiet (RMS=%.4f), discarding", rms)
+            events.emit(
+                "no_speech",
+                reason="below_rms_floor",
+                rms=round(float(rms), 4),
+                threshold=silence_threshold,
+            )
             return False
 
         # Trim trailing silence
@@ -80,6 +130,12 @@ def record_audio(
         ])
         speech_frames = energy > silence_threshold
         if not speech_frames.any():
+            events.emit(
+                "no_speech",
+                reason="no_speech_frames",
+                rms=round(float(rms), 4),
+                threshold=silence_threshold,
+            )
             return False
 
         # Find last speech frame
@@ -87,9 +143,11 @@ def record_audio(
         trim_end = min((last_speech + int(silence_timeout / 0.1)) * frame_size, len(audio_data))
         trimmed = audio_data[:trim_end]
 
-        # Save as WAV
+        # Save as WAV. PulseAudio can deliver float samples above 1.0 when the
+        # source gain exceeds unity; normalize before PCM conversion so signed
+        # int16 values do not wrap and destroy the waveform.
         import wave
-        trimmed_int16 = (trimmed * 32767).astype(np.int16)
+        trimmed_int16 = _float_audio_to_pcm16(trimmed)
         with wave.open(output_path, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
@@ -98,16 +156,54 @@ def record_audio(
 
         duration_actual = len(trimmed) / sample_rate
         logger.info("Recorded %.1fs of audio to %s", duration_actual, output_path)
+        events.emit("record", seconds=round(duration_actual, 2), rms=round(float(rms), 4))
         return True
 
     except Exception as exc:
         logger.error("Audio recording failed: %s", exc)
+        events.emit("error", stage="record", detail=str(exc))
         raise VoiceRecordingError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
 # Audio playback
 # ---------------------------------------------------------------------------
+
+def _probe_audio_duration(audio_path: str) -> Optional[float]:
+    """Return media duration in seconds, or None when ffprobe is unavailable."""
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                audio_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        duration = float(result.stdout.strip())
+        return duration if duration > 0 else None
+    except Exception as exc:
+        logger.debug("Could not probe audio duration: %s", exc)
+        return None
+
+
+def _audio_playback_timeout(audio_path: str) -> float:
+    """Bound playback above clip duration while still killing stuck players."""
+    duration = _probe_audio_duration(audio_path)
+    if duration is None:
+        return 60.0
+    return min(120.0, max(30.0, duration + 10.0))
+
 
 def play_audio_local(audio_path: str, device_id: Optional[int] = None) -> bool:
     """Play an audio file through local speakers via ffplay."""
@@ -125,7 +221,12 @@ def play_audio_local(audio_path: str, device_id: Optional[int] = None) -> bool:
                     cmd += ["-audio_device", str(device_id)]
             cmd.append(audio_path)
             try:
-                subprocess.run(cmd, capture_output=True, timeout=30, check=True)
+                subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=_audio_playback_timeout(audio_path),
+                    check=True,
+                )
                 return True
             except Exception as exc:
                 logger.error("%s playback failed: %s", player, exc)
@@ -282,7 +383,13 @@ class VoicePipeline:
         media_player_entity: Optional[str] = None,
         max_record_duration: float = 10.0,
         silence_timeout: float = 2.0,
+        speech_threshold: float = 0.005,
+        language: str = "en",
+        min_confidence: float = 0.15,
         confidence_threshold: float = 0.70,
+        wake_cooldown: float = 5.0,
+        follow_up_delay: float = 0.35,
+        max_follow_up_turns: int = 2,
     ) -> None:
         self._callback = callback  # (text: str) -> response: str
         self._wake_word = wake_word_engine
@@ -291,7 +398,23 @@ class VoicePipeline:
         self._media_player_entity = media_player_entity
         self._max_record_duration = max_record_duration
         self._silence_timeout = silence_timeout
-        self._confidence_threshold = confidence_threshold
+        self._speech_threshold = speech_threshold
+        self._language = language
+        self._min_confidence = min_confidence
+        # Retained as an ignored constructor argument for compatibility with
+        # older callers. The low floor above silently rejects hallucinations;
+        # it never triggers the former fake confirmation branch.
+        # Refractory period (cf. wyoming-satellite --wake-refractory-seconds):
+        # after a turn's TTS finishes, do not run wake-word detection until
+        # this many seconds have passed. The mic hears our own reply through
+        # the speakers and its reverb tail otherwise re-triggers the wake word
+        # within a second (observed scores 0.75–0.98 right after "spoken").
+        self._wake_cooldown = max(0.0, float(wake_cooldown))
+        self._last_turn_end = 0.0
+        self._follow_up_delay = max(0.0, float(follow_up_delay))
+        self._max_follow_up_turns = max(0, int(max_follow_up_turns))
+        self._follow_up_pending = False
+        self._follow_up_turns = 0
 
         self._thread: Optional[threading.Thread] = None
         self._state = VoicePipelineState()
@@ -334,18 +457,38 @@ class VoicePipeline:
             self._thread.join(timeout=3.0)
         logger.info("Voice pipeline stopped")
 
+    def _wait_out_cooldown(self) -> None:
+        """Sleep (in stop-responsive slices) until the wake cooldown expires."""
+        while self._state.enabled:
+            remaining = self._wake_cooldown - (time.monotonic() - self._last_turn_end)
+            if remaining <= 0 or self._wake_cooldown <= 0:
+                return
+            logger.debug("Wake cooldown: %.1fs remaining", remaining)
+            time.sleep(min(0.25, remaining))
+
     def _run_loop(self) -> None:
         """Main voice pipeline loop (runs in background thread)."""
         while self._state.enabled:
             try:
                 self._state.listening = True
 
-                # 1. Wait for wake word
-                if self._wake_word:
-                    detected = self._wake_word.listen(timeout_seconds=5.0)
-                    if not detected:
-                        continue
-                    self._state.wake_word_detected = True
+                follow_up = self._follow_up_pending
+                self._follow_up_pending = False
+                if follow_up:
+                    if self._follow_up_delay:
+                        time.sleep(self._follow_up_delay)
+                    events.emit("follow_up", phase="listening", turn=self._follow_up_turns)
+                    _play_wake_beep()
+                else:
+                    self._wait_out_cooldown()
+
+                    # 1. Wait for wake word
+                    if self._wake_word:
+                        detected = self._wake_word.listen(timeout_seconds=5.0)
+                        if not detected:
+                            continue
+                        self._state.wake_word_detected = True
+                        _play_wake_beep()
 
                 # 2. Record audio
                 cache_dir = Path.home() / ".hermes" / "voice_cache"
@@ -358,6 +501,7 @@ class VoicePipeline:
                         audio_path,
                         duration=self._max_record_duration,
                         silence_timeout=self._silence_timeout,
+                        silence_threshold=self._speech_threshold,
                     )
                 except Exception:
                     try:
@@ -367,10 +511,16 @@ class VoicePipeline:
                     raise
                 if not recorded:
                     os.unlink(audio_path)
+                    self._state.wake_word_detected = False
+                    self._follow_up_turns = 0
                     continue
 
                 # 3. STT
-                stt_result = self._stt.transcribe_with_confidence(audio_path)
+                stt_started = time.monotonic()
+                stt_result = self._stt.transcribe_with_confidence(
+                    audio_path, language=self._language
+                )
+                stt_elapsed = time.monotonic() - stt_started
                 transcript = stt_result.get("text", "").strip()
                 confidence = stt_result.get("confidence", 1.0)
 
@@ -384,31 +534,79 @@ class VoicePipeline:
                     pass
 
                 if not transcript:
+                    events.emit(
+                        "no_speech",
+                        reason="empty_transcript",
+                        stt_seconds=round(stt_elapsed, 2),
+                    )
                     continue
 
-                # Low confidence → ask for confirmation
-                if confidence < self._confidence_threshold:
-                    self._speak(f"Did you say: {transcript}?")
-                    # TODO: implement confirmation loop (P2)
+                if confidence < self._min_confidence:
+                    logger.debug(
+                        "Discarding STT hallucination below confidence floor: %.3f %r",
+                        confidence,
+                        transcript,
+                    )
+                    events.emit(
+                        "discarded",
+                        text=events.truncate(transcript),
+                        confidence=round(float(confidence), 3),
+                        min_confidence=self._min_confidence,
+                        stt_seconds=round(stt_elapsed, 2),
+                    )
+                    self._state.wake_word_detected = False
                     continue
 
                 logger.info("Voice input: \"%s\" (confidence=%.2f)", transcript, confidence)
+                events.emit(
+                    "heard",
+                    text=events.truncate(transcript),
+                    confidence=round(float(confidence), 3),
+                    stt_seconds=round(stt_elapsed, 2),
+                    language=self._language,
+                )
 
                 # 4. LLM callback
+                think_started = time.monotonic()
                 response = self._callback(transcript)
+                think_elapsed = time.monotonic() - think_started
 
                 if not response:
+                    events.emit(
+                        "reply",
+                        text="",
+                        empty=True,
+                        think_seconds=round(think_elapsed, 2),
+                    )
                     continue
 
+                events.emit(
+                    "reply",
+                    text=events.truncate(response),
+                    think_seconds=round(think_elapsed, 2),
+                )
+
                 # 5. TTS synthesis + playback
-                if not self._speak(response):
+                spoke = self._speak(response)
+                # Start the refractory clock when playback ends (success or
+                # not): the speaker tail is what re-triggers the wake word.
+                self._last_turn_end = time.monotonic()
+                if not spoke:
                     continue
 
                 self._state.total_interactions += 1
                 self._state.wake_word_detected = False
+                asks_question = response.rstrip().rstrip("\"'").endswith("?")
+                if asks_question and self._follow_up_turns < self._max_follow_up_turns:
+                    self._follow_up_turns += 1
+                    self._follow_up_pending = True
+                    events.emit("follow_up", phase="armed", turn=self._follow_up_turns)
+                else:
+                    self._follow_up_turns = 0
 
             except Exception as exc:
                 logger.error("Voice pipeline error: %s", exc, exc_info=True)
+                events.emit("error", stage="pipeline", detail=str(exc))
                 self._state.total_errors += 1
                 time.sleep(1.0)  # Back off on error
             finally:
@@ -416,7 +614,9 @@ class VoicePipeline:
 
     def _speak(self, text: str) -> bool:
         """Speak text through TTS + playback with retry fallback."""
+        sink = self._media_player_entity or "local speakers"
         for attempt in (1, 2):
+            started = time.monotonic()
             try:
                 audio_path = self._tts.synthesize(text)
                 if not audio_path:
@@ -427,9 +627,16 @@ class VoicePipeline:
                     played = play_audio_local(audio_path)
                 if not played:
                     raise RuntimeError("Audio playback failed")
+                events.emit(
+                    "spoken",
+                    sink=sink,
+                    attempt=attempt,
+                    tts_seconds=round(time.monotonic() - started, 2),
+                )
                 return True
             except Exception as exc:
                 logger.warning("TTS speak failed (attempt %d/2): %s", attempt, exc)
+                events.emit("speak_failed", sink=sink, attempt=attempt, detail=str(exc))
                 if attempt == 1:
                     time.sleep(0.5)  # brief backoff before retry
                 else:

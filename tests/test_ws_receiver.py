@@ -88,6 +88,22 @@ async def test_assist_query_handler_exception_returns_spoken_error():
     assert response["conversation_id"] == "conv-3"
 
 
+def test_state_change_returns_ha_recognized_state_ack():
+    """State updates must use the ACK type recognized by the HA integration."""
+
+    response = ws_receiver.handle_ha_ws_payload(
+        {"id": "state-1", "type": "state_changed", "entity_id": "light.kitchen"}
+    )
+
+    assert response == {
+        "id": "state-1",
+        "type": "state_ack",
+        "ok": True,
+        "received": "state_changed",
+        "entity_id": "light.kitchen",
+    }
+
+
 def test_sync_payload_handler_still_reports_unsupported_for_unknown_types():
     """Existing synchronous handler semantics are preserved."""
 

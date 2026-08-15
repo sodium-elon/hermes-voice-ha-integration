@@ -60,10 +60,30 @@ class FasterWhisperEngine(STTEngine):
     First call downloads the model from HuggingFace (~75MB for tiny).
     """
 
-    def __init__(self, model_size: str = "tiny", device: str = "auto", compute_type: str = "int8") -> None:
+    def __init__(
+        self,
+        model_size: str = "tiny",
+        device: str = "auto",
+        compute_type: str = "int8",
+        initial_prompt: Optional[str] = None,
+        hotwords: Optional[str] = None,
+        vad_filter: bool = False,
+        condition_on_previous_text: bool = False,
+        no_speech_threshold: Optional[float] = None,
+        log_prob_threshold: Optional[float] = None,
+    ) -> None:
         self._model_size = model_size
         self._device = device
         self._compute_type = compute_type
+        self._initial_prompt = initial_prompt
+        self._hotwords = hotwords
+        self._vad_filter = vad_filter
+        # Hallucination controls. condition_on_previous_text defaults to True
+        # upstream and lets one hallucinated segment seed the next; decoding
+        # each utterance independently keeps "Thanks for watching!" loops out.
+        self._condition_on_previous_text = condition_on_previous_text
+        self._no_speech_threshold = no_speech_threshold
+        self._log_prob_threshold = log_prob_threshold
         self._model = None  # Lazy-loaded
 
     def available(self) -> bool:
@@ -83,14 +103,37 @@ class FasterWhisperEngine(STTEngine):
             )
         return self._model
 
+    def _transcribe_options(self, language: Optional[str]) -> Dict[str, Any]:
+        options: Dict[str, Any] = {
+            "language": language,
+            "beam_size": 5,
+            "initial_prompt": self._initial_prompt,
+            "hotwords": self._hotwords,
+            "vad_filter": self._vad_filter,
+            "condition_on_previous_text": self._condition_on_previous_text,
+        }
+        if self._no_speech_threshold is not None:
+            options["no_speech_threshold"] = self._no_speech_threshold
+        if self._log_prob_threshold is not None:
+            options["log_prob_threshold"] = self._log_prob_threshold
+        # Ad-hoc overrides injected by the calibration harness (--sweep).
+        extra = getattr(self, "_extra_transcribe_options", None)
+        if extra:
+            options.update(extra)
+        return options
+
     def transcribe(self, audio_path: str, language: Optional[str] = None) -> str:
         model = self._get_model()
-        segments, info = model.transcribe(audio_path, language=language, beam_size=5)
+        segments, info = model.transcribe(
+            audio_path, **self._transcribe_options(language)
+        )
         return " ".join(seg.text.strip() for seg in segments)
 
     def transcribe_with_confidence(self, audio_path: str, language: Optional[str] = None) -> Dict[str, Any]:
         model = self._get_model()
-        segments, info = model.transcribe(audio_path, language=language, beam_size=5)
+        segments, info = model.transcribe(
+            audio_path, **self._transcribe_options(language)
+        )
         segment_list = list(segments)
         if not segment_list:
             return {"text": "", "confidence": 1.0, "language": info.language}
@@ -210,6 +253,12 @@ def create_stt_engine(engine_type: str = "faster-whisper", **kwargs: Any) -> STT
             model_size=kwargs.get("model_size", "tiny"),
             device=kwargs.get("device", "auto"),
             compute_type=kwargs.get("compute_type", "int8"),
+            initial_prompt=kwargs.get("initial_prompt"),
+            hotwords=kwargs.get("hotwords"),
+            vad_filter=bool(kwargs.get("vad_filter", False)),
+            condition_on_previous_text=bool(kwargs.get("condition_on_previous_text", False)),
+            no_speech_threshold=kwargs.get("no_speech_threshold"),
+            log_prob_threshold=kwargs.get("log_prob_threshold"),
         )
     elif engine_type == "whisper-cpp":
         return WhisperCPPEngine(model_path=kwargs.get("model_path"))

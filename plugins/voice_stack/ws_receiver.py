@@ -19,6 +19,8 @@ import time
 from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 
+from . import events
+
 try:
     from aiohttp import WSMsgType, web
     AIOHTTP_AVAILABLE = True
@@ -175,9 +177,11 @@ def handle_voice_action(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         result = _json_loads_maybe(handler(args))
         ok = bool(result.get("ok", True)) if "error" not in result else False
+        events.emit("voice_action", action=action, ok=ok, result=result)
         return {"ok": ok, "action": action, "result": result}
     except Exception as exc:  # pragma: no cover - defensive runtime guard
         logger.exception("voice_action %s failed", action)
+        events.emit("error", stage="voice_action", action=action, detail=str(exc))
         return {"ok": False, "action": action, "error": str(exc)}
 
 
@@ -215,7 +219,16 @@ async def handle_assist_query(payload: dict[str, Any]) -> dict[str, Any]:
     failed messages.
     """
     text = str(payload.get("text") or "").strip()
+    events.begin_turn()
+    events.emit(
+        "heard",
+        source="ha_assist",
+        text=events.truncate(text),
+        conversation_id=payload.get("conversation_id"),
+        language=payload.get("language"),
+    )
     if not text:
+        events.emit("error", stage="assist_query", detail="empty assist_query text")
         return _assist_response(
             payload,
             ok=False,
@@ -225,6 +238,7 @@ async def handle_assist_query(payload: dict[str, Any]) -> dict[str, Any]:
 
     handler = _ASSIST_QUERY_HANDLER
     if handler is None:
+        events.emit("error", stage="assist_query", detail="handler not configured")
         return _assist_response(
             payload,
             ok=False,
@@ -232,6 +246,7 @@ async def handle_assist_query(payload: dict[str, Any]) -> dict[str, Any]:
             error="assist_query handler is not configured",
         )
 
+    started = time.monotonic()
     try:
         result = handler(payload)
         if inspect.isawaitable(result):
@@ -241,6 +256,12 @@ async def handle_assist_query(payload: dict[str, Any]) -> dict[str, Any]:
         response_text = str(result.get("text") or "").strip()
         if not response_text:
             response_text = "I processed that, but did not get a spoken response."
+        events.emit(
+            "reply",
+            source="ha_assist",
+            text=events.truncate(response_text),
+            think_seconds=round(time.monotonic() - started, 2),
+        )
         extra = {
             k: v
             for k, v in result.items()
@@ -255,6 +276,7 @@ async def handle_assist_query(payload: dict[str, Any]) -> dict[str, Any]:
         )
     except Exception as exc:  # pragma: no cover - defensive runtime guard
         logger.exception("assist_query failed")
+        events.emit("error", stage="assist_query", detail=str(exc))
         return _assist_response(
             payload,
             ok=False,
@@ -276,7 +298,7 @@ def handle_ha_ws_payload(payload: dict[str, Any]) -> dict[str, Any]:
         # P0 receiver behaviour: acknowledge state pushes so HA knows Hermes
         # accepted the event. Context ingestion can be layered on this later.
         return _with_request_id(payload, {
-            "type": "ack",
+            "type": "state_ack",
             "ok": True,
             "received": "state_changed",
             "entity_id": payload.get("entity_id"),
