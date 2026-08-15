@@ -5,8 +5,9 @@ how to re-verify it.
 
 ## The rig
 
-- Mic + speakers live on **Tungsten** (`192.168.122.1`), reached over
-  PulseAudio TCP (`PULSE_SERVER=tcp:192.168.122.1:4713`).
+- Mic + speakers live on a separate machine from the gateway (called
+  *Tungsten* below; substitute your own `$MIC_HOST`), reached over
+  PulseAudio TCP (`PULSE_SERVER=tcp:$MIC_HOST:4713`).
 - Capture chain: ALC269VC internal mic → ALSA Capture +30 dB → PipeWire
   source `alsa_input.pci-0000_c6_00.6.analog-stereo` → gateway records
   16 kHz mono float32 via sounddevice.
@@ -46,7 +47,7 @@ VENV=~/.hermes/hermes-agent/venv/bin/python
 $VENV scripts/voice_stt_calibration.py --snr 15 5
 
 # air-gap battery: speakers → room → real mic (the real test)
-export PULSE_SERVER=tcp:192.168.122.1:4713
+export PULSE_SERVER=tcp:$MIC_HOST:4713
 $VENV scripts/voice_stt_calibration.py --acoustic --play-volume 100
 $VENV scripts/voice_stt_calibration.py --acoustic --play-volume 40
 
@@ -59,7 +60,7 @@ $VENV scripts/voice_stt_calibration.py --sweep
 
 ## Fixes applied
 
-1. **Tungsten source volume 41% → 30%** (`scripts/tungsten-mic-calibration.sh`
+1. **Capture source volume 41% → 30%** (`scripts/mic-calibration.sh`
    re-applies it). Live immediately, no gateway restart needed.
 2. **`plugins/voice_stack/engines/stt.py`**: decode each utterance
    independently (`condition_on_previous_text=False`, kills hallucination
