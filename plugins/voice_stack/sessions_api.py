@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_BASE_URL = "http://127.0.0.1:8642"
 DEFAULT_PROFILE_BASE_URLS = {
     "sportscoach": "http://127.0.0.1:8643",
+    "music": "http://127.0.0.1:8644",
 }
 DEFAULT_SESSION_ID = "voice-stack"
 CONNECT_TIMEOUT = 10.0
@@ -68,7 +69,12 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"}
 
 
-def ensure_session(name: Optional[str] = None, *, profile: Optional[str] = None) -> str:
+def ensure_session(
+    name: Optional[str] = None,
+    *,
+    profile: Optional[str] = None,
+    title: Optional[str] = None,
+) -> str:
     """Create the voice session if it does not exist yet; return its id.
 
     A fixed id is used rather than a persisted mapping file: re-creating it is
@@ -81,7 +87,7 @@ def ensure_session(name: Optional[str] = None, *, profile: Optional[str] = None)
         response = requests.post(
             f"{base_url(profile)}/api/sessions",
             headers=_headers(),
-            json={"id": sid, "title": "Voice (Hey Jarvis)"},
+            json={"id": sid, "title": title or "Voice (Hey Jarvis)"},
             timeout=CONNECT_TIMEOUT,
         )
     except requests.RequestException as exc:
@@ -124,15 +130,20 @@ def complete(
     system_prompt: Optional[str] = None,
     timeout: Optional[float] = None,
     on_tool: Optional[Callable[[str, str, dict], None]] = None,
+    session: Optional[str] = None,
+    session_title: Optional[str] = None,
 ) -> str:
     """Run one voice turn through the Sessions API and return the spoken text.
 
     ``on_tool`` is invoked as ``(phase, tool_name, payload)`` for every tool
     lifecycle event, so the caller can surface tool activity live.
+    ``session`` overrides the default session id, letting separate voice
+    surfaces keep their own conversation threads. ``session_title`` controls
+    the title used when creating that session.
     """
     import requests
 
-    sid = ensure_session(profile=profile)
+    sid = ensure_session(name=session, profile=profile, title=session_title)
     read_timeout = timeout if timeout is not None else float(
         os.getenv("HERMES_VOICE_AGENT_TIMEOUT", str(DEFAULT_READ_TIMEOUT))
     )

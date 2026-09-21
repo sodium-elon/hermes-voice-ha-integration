@@ -189,6 +189,28 @@ class TestStreamParsing:
         assert sessions_api.complete("fastest run", profile="sportscoach") == "Move, Private."
         assert calls == ["http://127.0.0.1:8643/api/sessions/voice-stack/chat/stream"]
 
+    def test_named_session_and_title_are_forwarded(self, api_key, monkeypatch):
+        import requests
+
+        ensured = []
+        response = FakeResponse(
+            [*sse("assistant.completed", {"content": "Resolved."})]
+        )
+
+        def fake_ensure(name=None, *, profile=None, title=None):
+            ensured.append((name, profile, title))
+            return name or "voice-stack"
+
+        monkeypatch.setattr(sessions_api, "ensure_session", fake_ensure)
+        monkeypatch.setattr(requests, "post", lambda *a, **k: response)
+
+        assert sessions_api.complete(
+            "hello",
+            session="alexa-hermes",
+            session_title="Alexa via Hermes",
+        ) == "Resolved."
+        assert ensured == [("alexa-hermes", None, "Alexa via Hermes")]
+
 
 class TestConfiguration:
     def test_base_url_and_session_id_are_overridable(self, monkeypatch):
@@ -204,3 +226,7 @@ class TestConfiguration:
     def test_sportscoach_has_a_separate_default_api_url(self, monkeypatch):
         monkeypatch.delenv("HERMES_SPORTSCOACH_API_BASE_URL", raising=False)
         assert sessions_api.base_url("sportscoach") == "http://127.0.0.1:8643"
+
+    def test_music_has_a_separate_default_api_url(self, monkeypatch):
+        monkeypatch.delenv("HERMES_MUSIC_API_BASE_URL", raising=False)
+        assert sessions_api.base_url("music") == "http://127.0.0.1:8644"

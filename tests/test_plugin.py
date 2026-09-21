@@ -1166,6 +1166,96 @@ class TestPipelineState:
         assert callbacks == ["Turn on the kitchen light"]
         assert spoken == ["Done."]
 
+    def test_pipeline_keeps_audio_through_callback_and_exposes_bounded_redecode(self, monkeypatch):
+        """Routing can re-listen to the same WAV before cleanup, without owning STT."""
+        import os
+        from plugins.voice_stack import pipeline as pipeline_module
+        from plugins.voice_stack.pipeline import VoicePipeline
+
+        calls = []
+        observed = {}
+
+        class FakeSTT:
+            def available(self):
+                return True
+
+            def transcribe_with_confidence(
+                self, audio_path, language=None, *, hotwords=None, initial_prompt=None
+            ):
+                calls.append((audio_path, language, hotwords, initial_prompt))
+                if initial_prompt:
+                    return {"text": "Play an artist with another artist", "confidence": 0.41}
+                voice_pipeline.state.enabled = False
+                return {"text": "Play that song by garbled name", "confidence": 0.29}
+
+        class FakeTTS:
+            def available(self):
+                return True
+
+        def callback(text, *, confidence, audio_path, redecode):
+            observed["text"] = text
+            observed["confidence"] = confidence
+            observed["audio_path"] = audio_path
+            observed["exists_during_callback"] = os.path.exists(audio_path)
+            observed["second"] = redecode(
+                initial_prompt="This is a complete spoken music request."
+            )
+            voice_pipeline.state.enabled = False
+            return "Done."
+
+        voice_pipeline = VoicePipeline(
+            callback=callback,
+            stt_engine=FakeSTT(),
+            tts_engine=FakeTTS(),
+            language="en",
+        )
+        voice_pipeline.state.enabled = True
+        monkeypatch.delenv("HERMES_VOICE_RETAIN_WAV", raising=False)
+        monkeypatch.setattr(pipeline_module, "record_audio", lambda *_a, **_k: True)
+        monkeypatch.setattr(voice_pipeline, "_speak", lambda _text: True)
+
+        voice_pipeline._run_loop()
+
+        assert observed["exists_during_callback"] is True
+        assert observed["second"]["text"] == "Play an artist with another artist"
+        assert calls[1][3] == "This is a complete spoken music request."
+        assert os.path.exists(observed["audio_path"]) is False
+
+    def test_pipeline_does_not_retry_callback_when_callback_body_raises_typeerror(self, monkeypatch):
+        """A callback bug is not evidence that the callback has an old signature."""
+        from plugins.voice_stack import pipeline as pipeline_module
+        from plugins.voice_stack.pipeline import VoicePipeline
+
+        callback_calls = []
+
+        class FakeSTT:
+            def available(self):
+                return True
+
+            def transcribe_with_confidence(self, _path, language=None, **_kwargs):
+                voice_pipeline.state.enabled = False
+                return {"text": "Play something", "confidence": 0.8}
+
+        class FakeTTS:
+            def available(self):
+                return True
+
+        def callback(text, **kwargs):
+            callback_calls.append((text, kwargs))
+            raise TypeError("inside callback")
+
+        voice_pipeline = VoicePipeline(
+            callback=callback,
+            stt_engine=FakeSTT(),
+            tts_engine=FakeTTS(),
+        )
+        voice_pipeline.state.enabled = True
+        monkeypatch.setattr(pipeline_module, "record_audio", lambda *_a, **_k: True)
+
+        voice_pipeline._run_loop()
+
+        assert len(callback_calls) == 1
+
     def test_hallucination_below_confidence_floor_is_silently_dropped(self, monkeypatch):
         from plugins.voice_stack import pipeline as pipeline_module
         from plugins.voice_stack.pipeline import VoicePipeline
@@ -1201,6 +1291,52 @@ class TestPipelineState:
         assert callbacks == []
         assert spoken == []
         assert voice_pipeline.state.total_interactions == 0
+
+    def test_silent_handled_response_completes_turn_without_tts(self, monkeypatch):
+        from plugins.voice_stack import pipeline as pipeline_module
+        from plugins.voice_stack.pipeline import VoicePipeline
+
+        spoken = []
+
+        class FakeWake:
+            def listen(self, timeout_seconds=5.0):
+                return True
+
+            def stop(self):
+                pass
+
+        class FakeSTT:
+            def available(self):
+                return True
+
+            def transcribe_with_confidence(self, _audio_path, language=None):
+                voice_pipeline.state.enabled = False
+                return {"text": "Play Nelly Furtado.", "confidence": 0.9}
+
+        class FakeTTS:
+            def available(self):
+                return True
+
+        voice_pipeline = VoicePipeline(
+            callback=lambda _text: pipeline_module.SILENT_HANDLED,
+            wake_word_engine=FakeWake(),
+            stt_engine=FakeSTT(),
+            tts_engine=FakeTTS(),
+            wake_cooldown=0,
+        )
+        voice_pipeline.state.enabled = True
+        voice_pipeline._follow_up_turns = 1
+        monkeypatch.setattr(pipeline_module, "record_audio", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(pipeline_module, "_play_wake_beep", lambda: None)
+        monkeypatch.setattr(voice_pipeline, "_speak", lambda text: spoken.append(text) or True)
+
+        voice_pipeline._run_loop()
+
+        assert spoken == []
+        assert voice_pipeline.state.total_interactions == 1
+        assert voice_pipeline.state.wake_word_detected is False
+        assert voice_pipeline._follow_up_turns == 0
+        assert voice_pipeline._last_turn_end > 0
 
     def test_question_response_relistens_without_second_wake_word(self, monkeypatch):
         from plugins.voice_stack import pipeline as pipeline_module
@@ -1269,6 +1405,147 @@ class TestPipelineState:
         ]
         assert len(beeps) == 2
 
+    def test_clarification_prompt_with_period_arms_follow_up(self):
+        from plugins.voice_stack.pipeline import _response_requests_follow_up
+
+        assert _response_requests_follow_up(
+            "At home it’s clear and 19.9 degrees Celsius; "
+            "Africa is vast, so name a city or country."
+        ) is True
+        assert _response_requests_follow_up(
+            "At home it’s clear and 19.9 degrees Celsius; "
+            "for Africa, I still need a city or country."
+        ) is True
+        assert _response_requests_follow_up(
+            "New York City is sunny at about 27 degrees Celsius."
+        ) is False
+        assert _response_requests_follow_up(
+            "I still need to install the weather integration."
+        ) is False
+
+    def test_alexa_follow_up_waits_for_estimated_reply_completion(self, monkeypatch):
+        from plugins.voice_stack import pipeline as pipeline_module
+        from plugins.voice_stack.pipeline import VoicePipeline
+
+        question = "Do you want me to play TV4 on the TV?"
+        sleeps = []
+
+        class FakeTTS:
+            def available(self):
+                return True
+
+        voice_pipeline = VoicePipeline(
+            callback=lambda _text: question,
+            stt_engine=object(),
+            tts_engine=FakeTTS(),
+            alexa_media_player_entity="media_player.john_s_echo_5th_right",
+            follow_up_delay=0.35,
+        )
+        monkeypatch.setattr(pipeline_module.time, "monotonic", lambda: 100.0)
+        monkeypatch.setattr(pipeline_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+        monkeypatch.setattr(pipeline_module, "play_text_alexa", lambda *_args, **_kwargs: True)
+
+        assert voice_pipeline._speak(question) is True
+        voice_pipeline._wait_before_follow_up()
+
+        assert sleeps == [pytest.approx(pipeline_module._estimate_alexa_speech_seconds(question))]
+        assert sleeps[0] > 0.35
+        assert sleeps[0] <= 12.0
+
+    def test_follow_up_uses_lower_confidence_floor_for_short_answers(self):
+        from plugins.voice_stack.pipeline import VoicePipeline
+
+        voice_pipeline = VoicePipeline(
+            callback=lambda text: text,
+            stt_engine=object(),
+            tts_engine=object(),
+            min_confidence=0.15,
+            follow_up_min_confidence=0.02,
+        )
+
+        assert voice_pipeline._confidence_floor(follow_up=False) == 0.15
+        assert voice_pipeline._confidence_floor(follow_up=True) == 0.02
+        assert 0.03 >= voice_pipeline._confidence_floor(follow_up=True)
+        assert 0.03 < voice_pipeline._confidence_floor(follow_up=False)
+
+    def test_alexa_target_speaks_response_via_notify_tts_without_local_audio(self, monkeypatch):
+        from plugins.voice_stack import pipeline as pipeline_module
+        from plugins.voice_stack.pipeline import VoicePipeline
+
+        alexa_calls = []
+        local_calls = []
+
+        class FakeTTS:
+            def available(self):
+                return True
+
+            def synthesize(self, _text):
+                raise AssertionError("Alexa text replies must not synthesize a local audio file")
+
+        voice_pipeline = VoicePipeline(
+            callback=lambda _text: "Hello",
+            stt_engine=object(),
+            tts_engine=FakeTTS(),
+            alexa_media_player_entity="media_player.john_s_echo_5th_right",
+        )
+        monkeypatch.setattr(
+            pipeline_module,
+            "play_text_alexa",
+            lambda text, target: alexa_calls.append((text, target)) or True,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            pipeline_module,
+            "play_audio_local",
+            lambda path: local_calls.append(path) or True,
+        )
+
+        assert voice_pipeline._speak("Hello") is True
+        assert alexa_calls == [("Hello", "media_player.john_s_echo_5th_right")]
+        assert local_calls == []
+
+    def test_alexa_notify_tts_uses_self_contained_ha_rest_client(self, monkeypatch):
+        import urllib.request
+
+        from plugins.voice_stack import pipeline
+
+        calls = []
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b"[]"
+
+        def fake_urlopen(req, timeout):
+            calls.append((req, timeout))
+            return FakeResponse()
+
+        monkeypatch.setenv("HASS_URL", "http://ha.local:8123")
+        monkeypatch.setenv("HASS_TOKEN", "test-token")
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        assert pipeline.play_text_alexa(
+            "Hello",
+            "media_player.john_s_echo_5th_right",
+        ) is True
+        assert len(calls) == 1
+        request, timeout = calls[0]
+        assert request.full_url == "http://ha.local:8123/api/services/notify/alexa_media"
+        assert timeout == 12
+        assert request.get_header("Authorization") == "Bearer test-token"
+        assert json.loads(request.data) == {
+            "message": "Hello",
+            "target": ["media_player.john_s_echo_5th_right"],
+            "data": {"type": "tts"},
+        }
+
     def test_audio_playback_timeout_exceeds_generated_clip_duration(self, monkeypatch):
         from plugins.voice_stack import pipeline
 
@@ -1294,6 +1571,18 @@ class TestPipelineState:
         assert pipeline.play_audio_local("answer.mp3") is True
         assert calls[0][1]["timeout"] == pytest.approx(40.96)
 
+    def test_voice_config_sets_alexa_tts_target(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+
+        monkeypatch.setenv(
+            "HERMES_ALEXA_MEDIA_PLAYER",
+            "media_player.john_s_echo_5th_right",
+        )
+
+        assert voice_stack._get_config()["alexa_media_player_entity"] == (
+            "media_player.john_s_echo_5th_right"
+        )
+
     def test_voice_config_sets_stt_language(self, monkeypatch):
         import plugins.voice_stack as voice_stack
 
@@ -1308,6 +1597,7 @@ class TestPipelineState:
         monkeypatch.setenv("HERMES_STT_HOTWORDS", "CNN, LCI, TF1")
         monkeypatch.setenv("HERMES_STT_VAD", "true")
         monkeypatch.setenv("HERMES_STT_MIN_CONFIDENCE", "0.15")
+        monkeypatch.setenv("HERMES_STT_FOLLOW_UP_MIN_CONFIDENCE", "0.02")
 
         stt = voice_stack._get_config()["stt"]
 
@@ -1315,6 +1605,114 @@ class TestPipelineState:
         assert stt["hotwords"] == "CNN, LCI, TF1"
         assert stt["vad_filter"] is True
         assert stt["min_confidence"] == 0.15
+        assert stt["follow_up_min_confidence"] == 0.02
+
+    def test_wake_beep_can_be_disabled_without_touching_audio_outputs(self, monkeypatch):
+        from plugins.voice_stack import pipeline
+
+        calls = []
+        monkeypatch.setenv("HERMES_WAKE_CUE_OUTPUT", "none")
+        monkeypatch.setattr(
+            pipeline,
+            "_play_wake_beep_blocking",
+            lambda: calls.append("blocking"),
+        )
+
+        class UnexpectedThread:
+            def __init__(self, *args, **kwargs):
+                calls.append("thread")
+
+        monkeypatch.setattr(pipeline.threading, "Thread", UnexpectedThread)
+
+        pipeline._play_wake_beep()
+
+        assert calls == []
+
+    def test_wake_beep_uses_alexa_announcement_without_local_audio(self, monkeypatch):
+        from plugins.voice_stack import pipeline
+
+        alexa_calls = []
+        local_calls = []
+        monkeypatch.setenv("HERMES_WAKE_CUE_OUTPUT", "alexa")
+        monkeypatch.setenv("HERMES_WAKE_CUE_TEXT", "")
+        monkeypatch.setenv(
+            "HERMES_ALEXA_MEDIA_PLAYER",
+            "media_player.john_s_echo_5th_right",
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "play_text_alexa",
+            lambda text, target, notification_type="tts", timeout=12: alexa_calls.append(
+                (text, target, notification_type, timeout)
+            ) or True,
+        )
+        monkeypatch.setattr(
+            pipeline.subprocess,
+            "run",
+            lambda *args, **kwargs: local_calls.append((args, kwargs)),
+        )
+
+        pipeline._play_wake_beep_blocking()
+
+        assert alexa_calls == [
+            (
+                ".",
+                "media_player.john_s_echo_5th_right",
+                "announce",
+                2,
+            )
+        ]
+        assert local_calls == []
+
+    def test_alexa_wake_cue_dispatch_is_synchronous(self, monkeypatch):
+        from plugins.voice_stack import pipeline
+
+        calls = []
+        monkeypatch.setenv("HERMES_WAKE_CUE_OUTPUT", "alexa")
+        monkeypatch.setenv("HERMES_WAKE_CUE_SETTLE_SECONDS", "2.5")
+        monkeypatch.setattr(
+            pipeline,
+            "_play_wake_beep_blocking",
+            lambda: calls.append("dispatched"),
+        )
+        monkeypatch.setattr(
+            pipeline.time,
+            "sleep",
+            lambda seconds: calls.append(("settled", seconds)),
+        )
+
+        class UnexpectedThread:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("Alexa cue must not be dispatched on a background thread")
+
+        monkeypatch.setattr(pipeline.threading, "Thread", UnexpectedThread)
+
+        pipeline._play_wake_beep()
+
+        assert calls == ["dispatched", ("settled", 2.5)]
+
+    def test_local_wake_cue_does_not_wait_for_alexa_settle(self, monkeypatch):
+        from plugins.voice_stack import pipeline
+
+        sleeps = []
+        started = []
+        monkeypatch.setenv("HERMES_WAKE_CUE_OUTPUT", "local")
+        monkeypatch.setenv("HERMES_WAKE_CUE_SETTLE_SECONDS", "2.5")
+        monkeypatch.setattr(pipeline.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                started.append(True)
+
+        monkeypatch.setattr(pipeline.threading, "Thread", FakeThread)
+
+        pipeline._play_wake_beep()
+
+        assert started == [True]
+        assert sleeps == []
 
     def test_wake_beep_uses_hermes_audio_cue(self, monkeypatch):
         from plugins.voice_stack import pipeline
@@ -1360,7 +1758,44 @@ class TestVoicePluginInit:
         assert "HERMES_WAKE_WORD_ENGINE" in data["config"]
         assert "HERMES_HA_WS_PORT" in data["config"]
         assert "HERMES_HA_WS_TOKEN" in data["config"]
+        assert "HERMES_ALEXA_MEDIA_PLAYER" in data["config"]
+        assert "HERMES_WAKE_CUE_OUTPUT" in data["config"]
+        assert "HERMES_WAKE_CUE_TEXT" in data["config"]
+        assert "HERMES_STT_FOLLOW_UP_MIN_CONFIDENCE" in data["config"]
         assert data["version"] == "0.0.12"
+
+    def test_voice_enable_passes_alexa_target_to_pipeline(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import pipeline as pipeline_module
+
+        captured = {}
+
+        class FakePipeline:
+            available = True
+
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.state = type("State", (), {"enabled": False})()
+
+            def start(self):
+                return True
+
+        monkeypatch.setenv(
+            "HERMES_ALEXA_MEDIA_PLAYER",
+            "media_player.john_s_echo_5th_right",
+        )
+        monkeypatch.setattr(voice_stack, "_ensure_voice_ready", lambda: None)
+        monkeypatch.setattr(pipeline_module, "VoicePipeline", FakePipeline)
+        voice_stack._voice_ready.set()
+        voice_stack._pipeline = None
+
+        result = json.loads(voice_stack._handle_voice_enable({}))
+
+        assert result["ok"] is True
+        assert captured["alexa_media_player_entity"] == (
+            "media_player.john_s_echo_5th_right"
+        )
+        voice_stack._pipeline = None
 
     def test_register_auto_enables_voice_when_requested(self, monkeypatch):
         import plugins.voice_stack as voice_stack
@@ -1706,6 +2141,119 @@ class TestVoiceLifecycleRobustness:
         with pytest.raises(RuntimeError, match="no response"):
             voice_stack._run_full_agent("What is the weather in Paris?")
 
+    def test_alexa_slow_ack_does_not_wait_for_last_called_lookup(self, monkeypatch):
+        import asyncio
+        import threading
+        import time
+
+        import plugins.voice_stack as voice_stack
+
+        agent_release = threading.Event()
+        target_release = threading.Event()
+        delivery_done = threading.Event()
+        delivery_threads = []
+
+        def slow_agent(*_args, **_kwargs):
+            agent_release.wait(1)
+            return "Final answer"
+
+        def slow_target_lookup(*_args, **_kwargs):
+            target_release.wait(1)
+            return "media_player.echo_dot_5th_left"
+
+        monkeypatch.setattr(voice_stack, "_run_full_agent", slow_agent)
+        monkeypatch.setattr(voice_stack, "_resolve_last_called_media_player", slow_target_lookup)
+        monkeypatch.setattr(voice_stack, "ALEXA_AGENT_BUDGET_SECONDS", 0.01)
+        monkeypatch.setattr(
+            voice_stack,
+            "_deliver_slow_answer",
+            lambda *_args, **_kwargs: (
+                delivery_threads.append(threading.current_thread().name),
+                delivery_done.set(),
+            ),
+        )
+
+        started = time.monotonic()
+        try:
+            result = asyncio.run(
+                asyncio.wait_for(
+                    voice_stack._handle_assist_query_with_llm(
+                        object(),
+                        {
+                            "text": "What is my fastest run?",
+                            "conversation_id": "alexa_hermes",
+                            "language": "en",
+                        },
+                    ),
+                    timeout=0.2,
+                )
+            )
+        finally:
+            agent_release.set()
+            target_release.set()
+
+        assert time.monotonic() - started < 0.2
+        assert result["text"] == voice_stack.ALEXA_SLOW_ACK
+        assert result["slow"] is True
+        assert delivery_done.wait(1)
+        assert delivery_threads != [threading.main_thread().name]
+
+    def test_alexa_slow_ack_preserves_queued_agent_when_executor_is_saturated(
+        self, monkeypatch
+    ):
+        import asyncio
+        import concurrent.futures
+        import threading
+
+        import plugins.voice_stack as voice_stack
+
+        release_workers = threading.Event()
+        agent_called = threading.Event()
+        delivery_done = threading.Event()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        blockers = [executor.submit(release_workers.wait) for _ in range(2)]
+
+        def queued_agent(*_args, **_kwargs):
+            agent_called.set()
+            return "Final answer"
+
+        monkeypatch.setattr(voice_stack, "ALEXA_EXECUTOR", executor)
+        monkeypatch.setattr(voice_stack, "ALEXA_AGENT_BUDGET_SECONDS", 0.01)
+        monkeypatch.setattr(voice_stack, "_run_full_agent", queued_agent)
+        monkeypatch.setattr(
+            voice_stack,
+            "_resolve_last_called_media_player",
+            lambda *_args, **_kwargs: "media_player.echo_dot_5th_left",
+        )
+        monkeypatch.setattr(
+            voice_stack,
+            "_deliver_slow_answer",
+            lambda *_args, **_kwargs: delivery_done.set(),
+        )
+
+        try:
+            result = asyncio.run(
+                voice_stack._handle_assist_query_with_llm(
+                    object(),
+                    {
+                        "text": "What is my fastest run?",
+                        "conversation_id": "alexa_hermes",
+                        "language": "en",
+                    },
+                )
+            )
+            release_workers.set()
+            assert agent_called.wait(1)
+            assert delivery_done.wait(1)
+        finally:
+            release_workers.set()
+            for blocker in blockers:
+                blocker.result(timeout=1)
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        assert result["text"] == voice_stack.ALEXA_SLOW_ACK
+        assert result["slow"] is True
+
     def test_voice_transcript_routes_to_builtin_ha_agent_before_llm(self, monkeypatch):
         import plugins.voice_stack as voice_stack
         from plugins.voice_stack import ha_conversation as ha_assistant
@@ -1782,6 +2330,16 @@ class TestVoiceLifecycleRobustness:
             llm = FailingLlm()
 
         monkeypatch.setattr(ha_conversation, "process_conversation", fake_process)
+        monkeypatch.setattr(
+            ha_conversation,
+            "run_live_channel",
+            lambda _target: {"ok": False, "reason": "not_found"},
+        )
+        # Not music: the Jev gate must say so so the flow falls through to the
+        # script retry instead of hitting the hermetic resolver.
+        monkeypatch.setattr(
+            voice_stack, "_jev_music_gate", lambda ctx, text: (False, False)
+        )
 
         response = voice_stack._route_voice_transcript(
             FakeContext(), "turn on cnn", language="en"
@@ -1824,6 +2382,15 @@ class TestVoiceLifecycleRobustness:
             }
 
         monkeypatch.setattr(ha_conversation, "process_conversation", fake_process)
+        monkeypatch.setattr(
+            ha_conversation,
+            "run_live_channel",
+            lambda _target: {"ok": False, "reason": "not_found"},
+        )
+        # Not music: gate says so; the flow retries the script, not the resolver.
+        monkeypatch.setattr(
+            voice_stack, "_jev_music_gate", lambda ctx, text: (False, False)
+        )
 
         response = voice_stack._route_voice_transcript(
             object(), "Turn on France 3.", language="en"
@@ -1949,6 +2516,11 @@ class TestVoiceLifecycleRobustness:
             }
 
         monkeypatch.setattr(ha_conversation, "process_conversation", reject)
+        # Not music: the gate says so; the flow must NOT hit the hermetic
+        # resolver or guess via the full agent.
+        monkeypatch.setattr(
+            voice_stack, "_jev_music_gate", lambda ctx, text: (False, False)
+        )
         monkeypatch.setattr(
             voice_stack,
             "_run_full_agent",
@@ -1963,6 +2535,254 @@ class TestVoiceLifecycleRobustness:
 
         assert calls == ["turn on mystery TV", "run mystery TV"]
         assert response == "I could not find that device."
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "Play Nelly Furtado.",
+            "Play Justin Bieber's latest album.",
+            "Play jazz.",
+            "Play more music.",
+        ],
+    )
+    def test_artist_play_request_defaults_to_configured_alexa_after_ha_no_target(
+        self, monkeypatch, command
+    ):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        monkeypatch.setenv(
+            "HERMES_ALEXA_MEDIA_PLAYER",
+            "media_player.john_s_echo_5th_right",
+        )
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "speech": {"plain": {"speech": "Sorry, I couldn't understand that"}},
+                    "data": {"code": "no_valid_targets"},
+                }
+            },
+        )
+        monkeypatch.setattr(
+            ha_conversation,
+            "run_live_channel",
+            lambda _target: {"ok": False, "reason": "no_unique_match"},
+        )
+        calls = []
+        monkeypatch.setattr(
+            ha_conversation,
+            "play_alexa_media",
+            lambda command, target: calls.append((command, target)) or {"ok": True},
+            raising=False,
+        )
+        # Resolver produces a verified command on the new seam; the router must
+        # dispatch it to the configured Alexa player, never the full agent.
+        monkeypatch.setattr(
+            voice_stack,
+            "_resolve_music_request",
+            lambda _ctx, _text, **_kw: {"command": "Play music on Apple Music"},
+        )
+        monkeypatch.setattr(
+            voice_stack,
+            "_run_full_agent",
+            lambda _text: (_ for _ in ()).throw(
+                AssertionError("Alexa music requests must not fall back to the agent")
+            ),
+        )
+
+        response = voice_stack._route_voice_transcript(object(), command, language="en")
+
+        assert response == ""
+
+    def test_lyric_clue_is_resolved_before_alexa_playback(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+        from plugins.voice_stack import music
+
+        request = "Play that song where they say hello from the other side in the lyrics."
+        monkeypatch.setenv(
+            "HERMES_ALEXA_MEDIA_PLAYER",
+            "media_player.john_s_echo_5th_right",
+        )
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "speech": {"plain": {"speech": "Sorry, I couldn't understand that"}},
+                    "data": {"code": "no_valid_targets"},
+                }
+            },
+        )
+        monkeypatch.setattr(
+            ha_conversation,
+            "run_live_channel",
+            lambda _target: {"ok": False, "reason": "no_unique_match"},
+        )
+        # Lyric clue -> described_song on the Jev seam. A catalog name match is
+        # not proof the user meant that track, so the resolver clarifies rather
+        # than fabricating "Hello by Adele" — and never reaches Alexa.
+        monkeypatch.setattr(
+            music,
+            "select_route",
+            lambda *_a, **_k: {
+                "operation": "described_song", "title": "hello from the other side",
+                "artist": "", "secondary": "", "confidence": 0.95,
+            },
+            raising=False,
+        )
+        from plugins.voice_stack import music as _music
+        monkeypatch.setattr(
+            _music,
+            "_write_telemetry",
+            lambda *a, **k: None,
+            raising=False,
+        )
+        calls = []
+        monkeypatch.setattr(
+            voice_stack,
+            "_write_playback_telemetry",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            ha_conversation,
+            "play_alexa_media",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("an unresolved lyric clue must not reach Alexa")
+            ),
+        )
+
+        response = voice_stack._route_voice_transcript(object(), request, language="en")
+
+        assert response == "Could you name the song or give its artist?"
+        assert calls == []
+
+    def test_dry_run_reports_command_without_dispatch(self, monkeypatch):
+        """HERMES_VOICE_DRY_RUN=1 reports the would-be command, never fires Echo."""
+        import plugins.voice_stack as voice_stack
+
+        calls = []
+        monkeypatch.setenv("HERMES_VOICE_DRY_RUN", "1")
+        monkeypatch.setattr(
+            voice_stack,
+            "_write_playback_telemetry",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            voice_stack,
+            "_dispatch_alexa_playback",
+            lambda command, target: calls.append((command, target)) or True,
+        )
+        from plugins.voice_stack.pipeline import SILENT_HANDLED
+
+        out = voice_stack._alexa_playback_return(
+            "Play the song Hello by Adele on Apple Music",
+            "media_player.john_s_echo_5th_right",
+            object(),
+            "play hello by adele",
+        )
+        assert out == "Dry run: I would ask Alexa to Play the song Hello by Adele on Apple Music"
+        assert calls == []  # nothing dispatched
+
+    def test_music_resolver_failure_asks_for_clarification(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation, music
+
+        monkeypatch.setenv(
+            "HERMES_ALEXA_MEDIA_PLAYER",
+            "media_player.john_s_echo_5th_right",
+        )
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "speech": {"plain": {"speech": "No target"}},
+                    "data": {"code": "no_valid_targets"},
+                }
+            },
+        )
+        monkeypatch.setattr(
+            ha_conversation,
+            "run_live_channel",
+            lambda _target: {"ok": False, "reason": "no_unique_match"},
+        )
+        # A descriptive clue ("...blue car in the video") routes to described_song
+        # on the Jev seam and clarifies — never auto-picks a catalog candidate.
+        monkeypatch.setattr(
+            music,
+            "select_route",
+            lambda *_a, **_k: {
+                "operation": "described_song", "title": "blue car in the video",
+                "artist": "", "secondary": "", "confidence": 0.95,
+            },
+            raising=False,
+        )
+        monkeypatch.setattr(music, "_catalog", lambda **kw: [], raising=False)
+        monkeypatch.setattr(
+            music,
+            "_write_telemetry",
+            lambda *a, **k: None,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            ha_conversation,
+            "play_alexa_media",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("Unresolved clues must not reach Alexa")
+            ),
+        )
+
+        response = voice_stack._route_voice_transcript(
+            object(), "Play that song with the blue car in the video.", language="en"
+        )
+
+        assert response == "Could you name the song or give its artist?"
+
+    def test_music_resolver_rejects_non_object_classification(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import music
+
+        # Route decision fails to yield a usable operation -> clarification.
+        monkeypatch.setattr(
+            music,
+            "select_route",
+            lambda *_a, **_k: {
+                "operation": "clarify", "confidence": 0.05,
+                "artist": "", "secondary": "", "title": "",
+            },
+            raising=False,
+        )
+        assert voice_stack._resolve_music_request(object(), "Play that song") == {
+            "clarification": "Which song do you mean?"
+        }
+
+    def test_music_resolver_rejects_chained_alexa_commands(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+
+        # A chained imperative is refused before the classifier/route runs.
+        assert voice_stack._resolve_music_request(
+            object(), "Play something relaxing and then turn off all lights"
+        ) == {
+            "clarification": "Which song do you mean?"
+        }
+
+    def test_music_resolver_returns_exact_unavailable_string(self, monkeypatch):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import music
+
+        def boom(_text):
+            raise music.TypeSafeUnavailable("down")
+        monkeypatch.setattr(music, "_classify", boom, raising=False)
+        monkeypatch.setattr(music, "_write_telemetry", lambda *a, **k: None, raising=False)
+        assert voice_stack._resolve_music_request(
+            object(), "Play Nelly Furtado"
+        ) == "TypeSafe API (Jev)  is unavailable"
 
     def test_voice_transcript_falls_back_to_hermes_only_when_ha_cannot_match(self, monkeypatch):
         import plugins.voice_stack as voice_stack
@@ -2053,6 +2873,518 @@ class TestVoiceLifecycleRobustness:
 
         assert response == "Sports Coach is unavailable right now."
 
+    def test_music_discussion_routes_to_music_profile(self, monkeypatch):
+        """A music question that is NOT a playback request goes to DJ Yakkuza."""
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation, music
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "data": {"code": "no_valid_targets"},
+                    "speech": {"plain": {"speech": "Sorry, I couldn't understand that"}},
+                }
+            },
+        )
+        calls = []
+
+        def fake_run(text, *, profile=None):
+            calls.append((text, profile))
+            return "Stromae dropped Folders earlier this year."
+
+        monkeypatch.setattr(voice_stack, "_run_full_agent", fake_run)
+
+        class FakeGate:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, ctx, text):
+                self.calls.append(text)
+                return (True, False)  # music: yes, playback: no
+
+        gate = FakeGate()
+        monkeypatch.setattr(voice_stack, "_jev_music_gate", gate)
+
+        response = voice_stack._route_voice_transcript(
+            object(), "What has Stromae released this year?", language="en"
+        )
+
+        assert response == "Stromae dropped Folders earlier this year."
+        assert calls == [("What has Stromae released this year?", "music")]
+        assert gate.calls == ["What has Stromae released this year?"]
+
+    def test_music_playback_routes_to_resolver_not_profile(self, monkeypatch):
+        """Music + playback goes to the resolver; the profile is not consulted."""
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "data": {"code": "no_valid_targets"},
+                    "speech": {"plain": {"speech": "Sorry, I couldn't understand that"}},
+                }
+            },
+        )
+        resolved = []
+
+        def fake_resolve(ctx, text, **kwargs):
+            resolved.append((text, kwargs))
+            return {"command": "Play the song des fleurs by Tove Lo & Stromae on Apple Music"}
+
+        monkeypatch.setattr(voice_stack, "_resolve_music_request", fake_resolve)
+
+        class FakeReturn:
+            def __call__(self, command, target, ctx, source):
+                resolved.append(("DISPATCHED", command))
+                return "Started des fleurs."
+
+        monkeypatch.setattr(voice_stack, "_alexa_playback_return", FakeReturn())
+        monkeypatch.setattr(
+            voice_stack, "_jev_music_gate",
+            lambda ctx, text: (True, True),  # music: yes, playback: yes
+        )
+        monkeypatch.setenv("HERMES_ALEXA_MEDIA_PLAYER", "media_player.john_s_echo_5th_right")
+
+        def fail_run(*_args, **_kwargs):
+            raise AssertionError("playback must not reach the profile agent")
+
+        monkeypatch.setattr(voice_stack, "_run_full_agent", fail_run)
+
+        response = voice_stack._route_voice_transcript(
+            object(), "stay to the loop featuring stormlight", language="en"
+        )
+
+        assert response == "Started des fleurs."
+        assert resolved[-1] == (
+            "DISPATCHED", "Play the song des fleurs by Tove Lo & Stromae on Apple Music"
+        )
+
+    def test_low_confidence_music_routes_original_and_generic_redecode_as_evidence(self, monkeypatch):
+        """The router plans from immutable hypotheses instead of rewriting pass one."""
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_a, **_k: {
+                "response": {
+                    "response_type": "error",
+                    "data": {"code": "no_valid_targets"},
+                    "speech": {"plain": {"speech": "Sorry"}},
+                }
+            },
+        )
+        monkeypatch.setenv("HERMES_ALEXA_MEDIA_PLAYER", "media_player.test")
+        seen = {}
+        redecode_calls = []
+
+        def redecode(*, hotwords=None, initial_prompt=None):
+            redecode_calls.append((hotwords, initial_prompt))
+            return {
+                "text": "Play that song by garbled artist with...",
+                "confidence": 0.34,
+            }
+
+        def resolve(_ctx, text, **kwargs):
+            seen["text"] = text
+            seen.update(kwargs)
+            return {"clarification": "Which artists did you mean?"}
+
+        monkeypatch.setattr(voice_stack, "_resolve_music_request", resolve)
+
+        response = voice_stack._route_voice_transcript(
+            object(),
+            "Play that song by garbled artist",
+            language="en",
+            confidence=0.29,
+            redecode=redecode,
+        )
+
+        assert response == "Which artists did you mean?"
+        assert seen["text"] == "Play that song by garbled artist"
+        assert seen["evidence"] == [
+            {
+                "text": "Play that song by garbled artist",
+                "confidence": 0.29,
+                "source": "initial",
+            },
+            {
+                "text": "Play that song by garbled artist with...",
+                "confidence": 0.34,
+                "source": "music_domain_redecode",
+            },
+        ]
+        # The re-listen is artist-agnostic (no candidate lookup before routing)
+        # and the generic music-domain prompt stays free of hardcoded names.
+        assert len(redecode_calls) == 1
+        # The re-listen is artist-agnostic: only the generic music-domain prompt
+        # assists it — no hotwords/candidate lookup precedes select_route.
+        first_prompt = redecode_calls[0][1]
+        assert isinstance(first_prompt, str) and first_prompt.strip()
+        # No curated/hardcoded name may leak into the prompt itself.
+        assert "artist names" not in redecode_calls[0][1].lower()
+
+    def test_gate_detected_low_confidence_music_uses_the_same_evidence_flow(self, monkeypatch):
+        """Heavy STT garble must not bypass planning merely because regex missed it."""
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_a, **_k: {
+                "response": {
+                    "response_type": "error",
+                    "data": {"code": "no_intent_match"},
+                    "speech": {"plain": {"speech": "Sorry"}},
+                }
+            },
+        )
+        monkeypatch.setenv("HERMES_ALEXA_MEDIA_PLAYER", "media_player.test")
+        monkeypatch.setattr(voice_stack, "_jev_music_gate", lambda *_a: (True, True))
+        seen = {}
+
+        def resolve(_ctx, text, **kwargs):
+            seen["text"] = text
+            seen.update(kwargs)
+            return {"clarification": "Please repeat the complete music request."}
+
+        monkeypatch.setattr(voice_stack, "_resolve_music_request", resolve)
+
+        response = voice_stack._route_voice_transcript(
+            object(),
+            "mangled words with no play prefix",
+            confidence=0.27,
+            redecode=lambda **_k: {
+                "text": "music request with...",
+                "confidence": 0.32,
+            },
+        )
+
+        assert response == "Please repeat the complete music request."
+        assert [row["source"] for row in seen["evidence"]] == [
+            "initial", "music_domain_redecode"
+        ]
+
+    def test_non_music_escalates_unchanged(self, monkeypatch):
+        """Not music → the gate is consulted, routing falls through to escalation."""
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "data": {"code": "no_valid_targets"},
+                    "speech": {"plain": {"speech": "Sorry, I couldn't understand that"}},
+                }
+            },
+        )
+        gate_calls = []
+        monkeypatch.setattr(
+            voice_stack, "_jev_music_gate",
+            lambda ctx, text: (gate_calls.append(text), (False, False))[1],
+        )
+
+        def fake_run(text, *, profile=None):
+            return "It is six thirty in Kyoto."
+
+        monkeypatch.setattr(voice_stack, "_run_full_agent", fake_run)
+
+        response = voice_stack._route_voice_transcript(
+            object(), "what time is it in Kyoto", language="en"
+        )
+
+        assert response == "It is six thirty in Kyoto."
+        assert gate_calls == ["what time is it in Kyoto"]
+
+    def test_jev_music_gate_outage_honors_exact_unavailable_string(self, monkeypatch):
+        """TypeSafe outage at the gate → the exact string, no dispatch, no agent."""
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation, music
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "data": {"code": "no_valid_targets"},
+                    "speech": {"plain": {"speech": "Sorry, I couldn't understand that"}},
+                }
+            },
+        )
+        monkeypatch.setattr(voice_stack, "_jev_music_gate", lambda ctx, text: None)
+
+        def fail_run(*_args, **_kwargs):
+            raise AssertionError("outage must not fall through to the agent")
+
+        monkeypatch.setattr(voice_stack, "_run_full_agent", fail_run)
+
+        response = voice_stack._route_voice_transcript(
+            object(), "the newest thing by that belgian artist would be nice", language="en"
+        )
+
+        assert response == music.UNAVAILABLE
+
+    def test_duckdb_artist_candidates_rank_musicbrainz_names(self, tmp_path, monkeypatch):
+        """Native DuckDB lookup combines phonetic and Jaro-Winkler candidates."""
+        import duckdb
+        from plugins.voice_stack import music
+
+        db = tmp_path / "artists.duckdb"
+        con = duckdb.connect(str(db))
+        con.execute("""
+            create table artist_names(
+                name text, canonical_name text, fame integer,
+                popularity integer, name_norm text, name_dm text
+            )
+        """)
+        con.executemany(
+            "insert into artist_names values (?, ?, ?, ?, ?, ?)",
+            [
+                ("Tove Lo", "Tove Lo", 2, 0, "tovelo", "TFL"),
+                ("Duvall", "Duvall", 1, 0, "duvall", "TFL"),
+                ("Radiohead", "Radiohead", 80, 0, "radiohead", "RTHT"),
+            ],
+        )
+        con.close()
+        monkeypatch.setattr(music, "ARTIST_DUCKDB_PATH", str(db))
+        monkeypatch.setattr(music, "ARTIST_DUCKDB_THREADS", 2)
+
+        assert music._duckdb_artist_candidates("Tuvalu", limit=4)[0] == "Tove Lo"
+        assert music._duckdb_artist_candidates("radiohed", limit=4)[0] == "Radiohead"
+
+    def test_repair_candidates_include_postgres_artist_matches(self, monkeypatch):
+        """The ranked artist index is the primary candidate source; the curated
+        vocabulary is only consulted when the index yields nothing."""
+        from plugins.voice_stack import music
+
+        monkeypatch.setattr(music, "_catalog", lambda **_kwargs: [])
+        monkeypatch.setattr(music, "_duckdb_artist_candidates", lambda term, limit=8: [])
+        monkeypatch.setattr(music, "_postgres_artist_candidates", lambda term, limit=8: ["Tove Lo", "Toto"])
+        monkeypatch.setattr(music, "_load_artist_vocabulary", lambda: ["Stromae"])
+
+        cands = music._repair_candidates("Tuvalu")
+        assert "Tove Lo" in cands
+        assert "Toto" in cands
+        assert "Stromae" in cands  # curated vocab is always folded in
+
+    def test_repair_candidates_fall_back_to_vocabulary_when_index_empty(self, monkeypatch):
+        """No index hit → curated vocabulary, then catalog, still offered."""
+        from plugins.voice_stack import music
+
+        monkeypatch.setattr(music, "_duckdb_artist_candidates", lambda term, limit=8: [])
+        monkeypatch.setattr(music, "_postgres_artist_candidates", lambda term, limit=8: [])
+        monkeypatch.setattr(music, "_load_artist_vocabulary", lambda: ["Stromae", "Madonna"])
+        monkeypatch.setattr(
+            music, "_catalog",
+            lambda **_kwargs: [{"artistName": "Tove Lo"}],
+        )
+
+        assert music._repair_candidates("Zzzqxx") == ["Stromae", "Madonna", "Tove Lo"]
+
+    def test_low_confidence_play_prefix_extracts_artist_before_comma_for_repair(self, monkeypatch):
+        """"Play Tuvalu, her latest..." repairs only the suspect artist phrase."""
+        from plugins.voice_stack import music
+
+        monkeypatch.setattr(music, "_repair_candidates", lambda terms: ["Tove Lo", "Toto"] if "Tuvalu" in terms else [])
+        monkeypatch.setattr(music, "_jev_select_artist", lambda state, questions, candidates: ("0", 0.91))
+
+        repaired = music._repair_artist("Play Tuvalu, her latest song featuring Strahan.", 0.255)
+        assert repaired == "Play Tove Lo, her latest song featuring Strahan."
+
+    def test_repair_candidates_always_include_listening_vocabulary(self, monkeypatch):
+        """DB index cross-references suspects AND the curated vocab is never
+        starved — Jev must see the artists the owner actually listens to."""
+        from plugins.voice_stack import music
+
+        monkeypatch.setattr(music, "_duckdb_artist_candidates", lambda term, limit=8: ["Lake Stovall"])
+        monkeypatch.setattr(music, "_postgres_artist_candidates", lambda term, limit=8: [])
+        monkeypatch.setattr(music, "_load_artist_vocabulary", lambda: ["Tove Lo", "Stromae"])
+        monkeypatch.setattr(music, "_catalog", lambda **_kwargs: [])
+
+        cands = music._repair_candidates(["Lake Toogaloo", "Squirrelhide"])
+        assert "Lake Stovall" in cands  # index cross-ref present
+        assert "Tove Lo" in cands       # curated vocab always offered
+        assert "Stromae" in cands
+
+    def test_split_suspect_slots_extracts_primary_and_featured(self):
+        """'X featuring Y' splits into two cross-reference slots, stripping
+        play-prefix and trailing descriptors — never the whole sentence."""
+        from plugins.voice_stack import music
+
+        assert music._split_suspect_slots(
+            "Play Lake Toogaloo featuring Squirrelhide early in the summer"
+        ) == ("Lake Toogaloo", "Squirrelhide")
+        assert music._split_suspect_slots(
+            "Play Tuvalu, her latest song featuring Strahan."
+        ) == ("Tuvalu", "Strahan")
+
+    def test_low_confidence_garbage_never_raw_passthrough(self, monkeypatch):
+        """Below the repair floor, a clarification must NOT be overridden by the raw fallback."""
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation, music
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "data": {"code": "no_valid_targets"},
+                    "speech": {"plain": {"speech": "Sorry, I couldn't understand that"}},
+                }
+            },
+        )
+        monkeypatch.setenv("HERMES_ALEXA_MEDIA_PLAYER", "media_player.john_s_echo_5th_right")
+        monkeypatch.setattr(
+            voice_stack, "_resolve_music_request",
+            lambda ctx, text, *, confidence=1.0, **_kwargs: {"clarification": "I didn't catch the artist — who did you mean?"},
+        )
+
+        def fail_dispatch(*_a, **_k):
+            raise AssertionError("low-confidence garbage must not reach the raw passthrough")
+
+        monkeypatch.setattr(voice_stack, "_alexa_playback_return", fail_dispatch)
+
+        response = voice_stack._route_voice_transcript(
+            object(), "Play Tuvalu, her latest song featuring Strahan.",
+            language="en", confidence=0.255,
+        )
+        assert response == "I didn't catch the artist — who did you mean?"
+
+    def test_low_confidence_genre_year_consensus_bypasses_artist_planner(self, monkeypatch):
+        """Two matching STT passes for genre+year are complete evidence; there
+        is no artist slot to repair and no justification for an ask-back."""
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "data": {"code": "no_intent_match"},
+                    "speech": {"plain": {"speech": "Sorry"}},
+                }
+            },
+        )
+        monkeypatch.setenv("HERMES_ALEXA_MEDIA_PLAYER", "media_player.john_s_echo_5th_right")
+        monkeypatch.setattr(
+            voice_stack,
+            "_resolve_music_request",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("genre+year consensus must not enter artist planning")
+            ),
+        )
+        dispatched = []
+        monkeypatch.setattr(
+            voice_stack,
+            "_alexa_playback_return",
+            lambda command, target, ctx, source: (dispatched.append(command), "Sent.")[1],
+        )
+
+        response = voice_stack._route_voice_transcript(
+            object(),
+            "Play some jazz music from 2026.",
+            language="en",
+            confidence=0.354,
+            redecode=lambda **_kw: {
+                "text": "Play some jazz music from 2026.",
+                "confidence": 0.579,
+            },
+        )
+
+        assert response == "Sent."
+        assert dispatched == ["Play some jazz music from 2026 on Apple Music"]
+
+    def test_low_confidence_genre_year_disagreement_still_fails_closed(self, monkeypatch):
+        """The narrow bypass requires transcript consensus, not merely shape."""
+        import plugins.voice_stack as voice_stack
+
+        evidence = [
+            {"text": "Play some jazz music from 2026.", "confidence": 0.354},
+            {"text": "Play some jazz music from 2016.", "confidence": 0.579},
+        ]
+        assert voice_stack._genre_year_request(evidence[0]["text"])
+        assert not voice_stack._evidence_agrees_verbatim(evidence)
+
+    def test_high_confidence_clean_phrase_keeps_raw_fallback(self, monkeypatch):
+        """At/above the floor, a clean phrase still falls back to verbatim Apple Music."""
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "data": {"code": "no_valid_targets"},
+                    "speech": {"plain": {"speech": "Sorry, I couldn't understand that"}},
+                }
+            },
+        )
+        monkeypatch.setenv("HERMES_ALEXA_MEDIA_PLAYER", "media_player.john_s_echo_5th_right")
+        monkeypatch.setattr(
+            voice_stack, "_resolve_music_request",
+            lambda ctx, text, *, confidence=1.0, **_kwargs: {"clarification": "Which song do you mean?"},
+        )
+        dispatched = []
+        monkeypatch.setattr(
+            voice_stack, "_alexa_playback_return",
+            lambda command, target, ctx, source: (dispatched.append(command), "Dry run.")[1],
+        )
+
+        voice_stack._route_voice_transcript(
+            object(), "play some jazz", language="en", confidence=0.9,
+        )
+        assert dispatched and dispatched[0].endswith("on Apple Music")
+
+    def test_no_intent_match_still_reaches_music_gate(self, monkeypatch):
+        """HA's no_intent_match (not just no_valid_targets) must route music."""
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        monkeypatch.setattr(
+            ha_conversation,
+            "process_conversation",
+            lambda *_args, **_kwargs: {
+                "response": {
+                    "response_type": "error",
+                    "data": {"code": "no_intent_match"},
+                    "speech": {"plain": {"speech": "Sorry, I couldn't understand that"}},
+                }
+            },
+        )
+        gate_calls = []
+        monkeypatch.setattr(
+            voice_stack, "_jev_music_gate",
+            lambda ctx, text: (gate_calls.append(text), (False, False))[1],
+        )
+
+        def fake_run(text, *, profile=None):
+            return "I can't play that."
+
+        monkeypatch.setattr(voice_stack, "_run_full_agent", fake_run)
+
+        voice_stack._route_voice_transcript(
+            object(), "Take two balloons play the song", language="en",
+        )
+        assert gate_calls == ["Take two balloons play the song"]
+
     def test_voice_enable_routes_transcript_through_home_assistant(self, monkeypatch):
         import plugins.voice_stack as voice_stack
         from plugins.voice_stack import ha_conversation as ha_assistant
@@ -2136,7 +3468,7 @@ class TestVoiceLifecycleRobustness:
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setattr(voice_stack, "_ensure_voice_ready", lambda: True)
         monkeypatch.setattr(voice_stack, "_stt_engine", FakeSTT())
-        monkeypatch.setattr("plugins.voice_stack.pipeline.record_audio", lambda path, duration: False)
+        monkeypatch.setattr("plugins.voice_stack.pipeline.record_audio", lambda *a, **k: False)
         voice_stack._voice_ready.set()
         try:
             result = json.loads(voice_stack._handle_voice_listen({"duration": 1}))
@@ -2155,7 +3487,7 @@ class TestVoiceLifecycleRobustness:
             def available(self):
                 return True
 
-        def boom(path, duration):
+        def boom(*_args, **_kwargs):
             raise VoiceRecordingError("microphone unavailable")
 
         monkeypatch.setenv("HOME", str(tmp_path))
@@ -2282,3 +3614,196 @@ def test_plugins_import_from_user_plugin_namespace(monkeypatch, tmp_path):
 
     assert hasattr(home_assistant, "register")
     assert hasattr(voice_stack, "register")
+
+
+class TestMusicEvidenceFailClosed:
+    """Re-listening a low-confidence request is REQUIRED before planning."""
+
+    def test_below_floor_returns_both_passes_when_relist_succeeds(self, monkeypatch):
+        from plugins.voice_stack import _collect_music_evidence
+        from plugins.voice_stack import music
+
+        captured = {}
+
+        def redecode(**kwargs):
+            captured["initial_prompt"] = kwargs.get("initial_prompt")
+            return {"text": "Play Bjork and Rosalia", "confidence": 0.82}
+
+        out = _collect_music_evidence(
+            "Play Toe-to-Doo-Doo-Doo", music.STT_REPAIR_CONFIDENCE_FLOOR - 0.05, redecode
+        )
+        assert out is not None
+        assert [row["source"] for row in out] == ["initial", "music_domain_redecode"]
+        # The re-listen is artist-agnostic (no hotwords/candidate lookup before
+        # routing): it is assisted only by a generic music-domain prompt.
+        assert isinstance(captured["initial_prompt"], str)
+        assert captured["initial_prompt"].strip()
+        assert "artist names" not in captured["initial_prompt"].lower()
+
+    def test_below_floor_fails_closed_when_relist_raises(self, monkeypatch):
+        from plugins.voice_stack import _collect_music_evidence
+        from plugins.voice_stack import music
+
+        def redecode(**_kwargs):
+            raise RuntimeError("stt outage")
+
+        out = _collect_music_evidence("Play something", 0.2, redecode)
+        assert out is None
+
+    def test_below_floor_fails_closed_when_relist_yields_no_text(self, monkeypatch):
+        from plugins.voice_stack import _collect_music_evidence
+        from plugins.voice_stack import music
+
+        assert _collect_music_evidence("Play something", 0.2, lambda **_k: {}) is None
+        assert (
+            _collect_music_evidence("Play something", 0.2, lambda **_k: {"text": ""}) is None
+        )
+        assert (
+            _collect_music_evidence("Play something", 0.2, lambda **_k: ["not-a-dict"]) is None
+        )
+
+    def test_at_or_above_floor_skips_relist(self, monkeypatch):
+        from plugins.voice_stack import _collect_music_evidence
+        from plugins.voice_stack import music
+
+        calls = []
+
+        def redecode(**_kwargs):
+            calls.append(True)
+            return {"text": "Play Bjork", "confidence": 0.9}
+
+        out = _collect_music_evidence(
+            "Play Bjork", music.STT_REPAIR_CONFIDENCE_FLOOR + 0.1, redecode
+        )
+        assert out is not None
+        assert len(out) == 1
+        assert calls == []
+
+
+class TestAlexaDryRunCaseInsensitive:
+    def test_dry_run_honours_uppercase_and_on(self, monkeypatch):
+        from plugins.voice_stack import _alexa_playback_return
+        from plugins.voice_stack import _write_playback_telemetry
+
+        monkeypatch.setattr(
+            "plugins.voice_stack._write_playback_telemetry", lambda *_a, **_k: None
+        )
+        monkeypatch.setenv("HERMES_VOICE_DRY_RUN", "TRUE")
+        out = _alexa_playback_return("Play the song Africa on Apple Music", "a", object(), "x")
+        assert "Dry run" in out
+
+        monkeypatch.setenv("HERMES_VOICE_DRY_RUN", "on")
+        out = _alexa_playback_return("Play the song Africa on Apple Music", "a", object(), "x")
+        assert "Dry run" in out
+
+
+class TestNormalizeEvidenceSanitizesConfidence:
+    def test_nan_inf_and_out_of_range_become_zero(self):
+        from plugins.voice_stack import music
+
+        rows = [
+            {"text": "Play one", "confidence": float("nan"), "source": "initial"},
+            {"text": "Play two", "confidence": float("inf"), "source": "initial"},
+            {"text": "Play three", "confidence": 1.5, "source": "initial"},
+            {"text": "Play four", "confidence": -0.2, "source": "initial"},
+            {"text": "Play five", "confidence": "bogus", "source": "initial"},
+            {"text": "Play six", "confidence": 0.42, "source": "initial"},
+        ]
+        out = music._normalize_evidence("unused", 1.0, evidence=rows)
+        assert [row["confidence"] for row in out] == [0.0, 0.0, 0.0, 0.0, 0.0, 0.42]
+
+
+class TestPipelineSttFailureCleanup:
+    def test_stt_exception_finalizes_wav(self, monkeypatch):
+        from plugins.voice_stack import pipeline as pipeline_module
+        from plugins.voice_stack.pipeline import VoicePipeline
+
+        observed = {}
+
+        class FakeTTS:
+            def available(self):
+                return True
+
+        class FakeSTT:
+            def available(self):
+                return True
+
+            def transcribe_with_confidence(self, path, language=None, **_kwargs):
+                observed["audio_path"] = path
+                voice_pipeline.state.enabled = False
+                raise RuntimeError("stt down")
+
+        voice_pipeline = VoicePipeline(
+            callback=lambda *_a, **_k: "Done.",
+            stt_engine=FakeSTT(),
+            tts_engine=FakeTTS(),
+        )
+        voice_pipeline.state.enabled = True
+        monkeypatch.delenv("HERMES_VOICE_RETAIN_WAV", raising=False)
+        monkeypatch.setattr(pipeline_module, "record_audio", lambda *_a, **_k: True)
+
+        voice_pipeline._run_loop()
+
+        # The WAV is owned by this turn and must not leak when STT raises
+        # before the callback's cleanup runs.
+        assert observed["audio_path"]
+        assert os.path.exists(observed["audio_path"]) is False
+
+
+class TestVoiceFollowUpTimeout:
+    def test_follow_up_uses_bounded_timeout_not_full_record(self, monkeypatch):
+        """Wake-word listening never times out; only an UNANSWERED follow-up
+        is bounded — during follow-up, capture waits at most the timeout."""
+        from plugins.voice_stack import pipeline as pipeline_module
+        from plugins.voice_stack.pipeline import VoicePipeline
+
+        monkeypatch.setenv("HERMES_FOLLOW_UP_TIMEOUT", "4")
+        durations = []
+        listened = []
+
+        class FakeWake:
+            def listen(self, timeout_seconds=None):
+                listened.append(True)
+                voice_pipeline.state.enabled = False
+                return True
+
+            def stop(self):
+                pass
+
+        class FakeTTS:
+            def available(self):
+                return True
+
+        class FakeSTT:
+            def available(self):
+                return True
+
+            def transcribe_with_confidence(self, _path, language=None, **_k):
+                voice_pipeline.state.enabled = False
+                return {"text": "Yes", "confidence": 0.9}
+
+        def fake_record(path, **kw):
+            durations.append(kw.get("duration"))
+            return True
+
+        monkeypatch.setattr(pipeline_module, "record_audio", fake_record)
+        monkeypatch.setattr(pipeline_module, "_play_wake_beep", lambda: None)
+
+        voice_pipeline = VoicePipeline(
+            callback=lambda *_a, **_k: "Done.",
+            wake_word_engine=FakeWake(),
+            stt_engine=FakeSTT(),
+            tts_engine=FakeTTS(),
+            wake_cooldown=0.0,
+            max_record_duration=10.0,
+        )
+        voice_pipeline.state.enabled = True
+        voice_pipeline._follow_up_pending = True  # armed, expecting quick answer
+        voice_pipeline._follow_up_turns = 1
+
+        voice_pipeline._run_loop()
+
+        # The follow-up waited the bounded timeout (4s), NOT the full 10s record.
+        assert durations == [4.0]
+        # Follow-up does NOT consult the wake word.
+        assert listened == []

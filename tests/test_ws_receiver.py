@@ -118,8 +118,8 @@ def test_sync_payload_handler_still_reports_unsupported_for_unknown_types():
 
 
 @pytest.mark.asyncio
-async def test_voice_stack_assist_handler_uses_ctx_llm():
-    """The registered voice-stack handler should call Hermes plugin LLM access."""
+async def test_voice_stack_assist_handler_uses_ctx_llm(monkeypatch):
+    """The Assist handler should fall back to plugin LLM when Sessions is unavailable."""
 
     class _Result:
         text = "LLM reply"
@@ -139,6 +139,11 @@ async def test_voice_stack_assist_handler_uses_ctx_llm():
             self.llm = _Llm()
 
     ctx = _Ctx()
+    monkeypatch.setattr(
+        voice_stack,
+        "_run_full_agent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
 
     result = await voice_stack._handle_assist_query_with_llm(
         ctx,

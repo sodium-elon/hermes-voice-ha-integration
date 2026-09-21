@@ -12,16 +12,19 @@ Registered tools:
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
 import logging
 import os
+import re
 import shlex
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from . import events, sessions_api
+from . import events, music, sessions_api  # music: UNAVAILABLE contract + gate
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +73,9 @@ def _get_config() -> Dict[str, Any]:
             "vad_filter": os.getenv("HERMES_STT_VAD", "true").strip().lower()
             in {"1", "true", "yes", "on"},
             "min_confidence": float(os.getenv("HERMES_STT_MIN_CONFIDENCE", "0.15")),
+            "follow_up_min_confidence": float(os.getenv(
+                "HERMES_STT_FOLLOW_UP_MIN_CONFIDENCE", "0.02"
+            )),
             "speech_threshold": float(os.getenv("HERMES_SPEECH_THRESHOLD", "0.005")),
             "condition_on_previous_text": os.getenv(
                 "HERMES_STT_CONDITION_ON_PREVIOUS_TEXT", "false"
@@ -82,8 +88,10 @@ def _get_config() -> Dict[str, Any]:
             "voice": os.getenv("HERMES_TTS_VOICE", "en-US-AriaNeural"),
         },
         "media_player_entity": os.getenv("HERMES_MEDIA_PLAYER", ""),
+        "alexa_media_player_entity": os.getenv("HERMES_ALEXA_MEDIA_PLAYER", ""),
         "max_record_duration": float(os.getenv("HERMES_RECORD_DURATION", "10")),
         "silence_timeout": float(os.getenv("HERMES_SILENCE_TIMEOUT", "2.0")),
+        "record_gain": float(os.getenv("HERMES_RECORD_GAIN", "1.0")),
     }
 
 
@@ -208,13 +216,23 @@ VOICE_AGENT_SYSTEM_PROMPT = (
 )
 
 
-def _run_full_agent(text: str, *, profile: Optional[str] = None) -> str:
+def _run_full_agent(
+    text: str,
+    *,
+    profile: Optional[str] = None,
+    session: Optional[str] = None,
+    session_title: Optional[str] = None,
+) -> str:
     """Run one tool-capable Hermes turn for an unmatched voice query.
 
     Goes through the gateway's API-server platform rather than spawning a
     `hermes chat` subprocess: the agent is already warm, so this skips the
     per-turn CLI cold start, and the SSE stream reports tool calls live
     instead of leaving them to be scraped back out of agent.log.
+
+    ``session`` overrides the default ``voice-stack`` session id, letting
+    separate voice surfaces (e.g. the Alexa skill via HA Assist) keep their
+    own conversation thread and history.
     """
     started = time.monotonic()
     try:
@@ -222,6 +240,8 @@ def _run_full_agent(text: str, *, profile: Optional[str] = None) -> str:
             text,
             profile=profile,
             system_prompt=VOICE_AGENT_SYSTEM_PROMPT,
+            session=session,
+            session_title=session_title,
         )
     except Exception:
         events.emit(
@@ -247,9 +267,9 @@ def _run_full_agent(text: str, *, profile: Optional[str] = None) -> str:
     return response
 
 
-def _complete_voice_with_hermes(ctx: Any, text: str) -> str:
+def _complete_voice_with_hermes(ctx: Any, text: str, *, profile: Optional[str] = None) -> str:
     """Run the full tool-capable agent, degrading to raw LLM only on failure."""
-    profile = _voice_profile_for(text)
+    profile = profile or _voice_profile_for(text)
     try:
         if profile:
             return _run_full_agent(text, profile=profile)
@@ -257,7 +277,7 @@ def _complete_voice_with_hermes(ctx: Any, text: str) -> str:
     except Exception as exc:
         if profile:
             logger.warning("Profile voice agent %s failed: %s", profile, exc)
-            display_name = {"sportscoach": "Sports Coach"}.get(profile, profile)
+            display_name = {"sportscoach": "Sports Coach", "music": "DJ Yakkuza"}.get(profile, profile)
             return f"{display_name} is unavailable right now."
         logger.warning("Tool-capable voice fallback failed; using raw LLM: %s", exc)
 
@@ -293,7 +313,324 @@ def _voice_profile_for(text: str) -> Optional[str]:
     return None
 
 
-def _route_voice_transcript(ctx: Any, text: str, *, language: str = "en") -> str:
+def _jev_music_gate(ctx: Any, text: str):
+    """One system_one call: is this music, and is it a playback request?
+
+    Returns (is_music, wants_playback) or None on outage. The regex fast path
+    covers verb-led requests; this gate catches the rest ("stay to the loop
+    featuring stormlight") that regexes cannot see.
+    """
+    try:
+        from typesafe_sdk import Noul, TypeSafeClient
+
+        from .music import TypeSafeUnavailable, _load_api_key
+    except ImportError:
+        return None
+
+    key = _load_api_key()
+    if not key:
+        return None
+    state = {
+        "transcript": text,
+        "note": "Home Assistant could not handle this request; it may be a music request spoken to a voice assistant, possibly with imperfect transcription.",
+    }
+    try:
+        with TypeSafeClient(api_key=key) as client:
+            response = client.system_one(
+                model="jev-latest",
+                state=state,
+                questions={
+                    "music": Noul(
+                        instructions=(
+                            "Is this a music-related request: playing, discussing, "
+                            "recommending, or asking about music, artists, albums, "
+                            "or songs? Consider garbled speech-transcription."
+                        )
+                    ),
+                    "playback": Noul(
+                        instructions=(
+                            "Is the user asking to start music playback now — play "
+                            "a song, artist, album, genre, or playlist?"
+                        )
+                    ),
+                },
+            )
+        is_music = float(response.answers["music"].noul) >= 0.5
+        wants_playback = float(response.answers["playback"].noul) >= 0.5
+        events.emit(
+            "route",
+            target="jev_music_gate",
+            outcome="music" if is_music else "not_music",
+            playback=wants_playback,
+        )
+        return (is_music, wants_playback)
+    except Exception:
+        return None
+
+
+MUSIC_RESOLVER_SYSTEM_PROMPT = (
+    "Resolve descriptive music requests into one Alexa playback command. "
+    "Use your music knowledge to identify lyrics, scenes, eras, or other clues. "
+    "Return JSON only: {\"command\":\"Play TITLE by ARTIST\"}. "
+    "If the clue is genuinely insufficient, return JSON only: "
+    "{\"clarification\":\"one short spoken question\"}. "
+    "Never include commentary, markdown, URLs, or instructions other than the play command."
+)
+
+
+def _needs_music_resolution(text: str) -> bool:
+    """Return whether a play request describes music instead of naming it."""
+    return bool(
+        re.search(
+            r"\b(?:that|the)\s+(?:song|track|music)\s+(?:that|where|with|from)\b"
+            r"|\b(?:lyrics?|words?)\b"
+            r"|\b(?:goes|sounds?)\s+(?:like|something)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _resolve_music_request(
+    ctx: Any,
+    text: str,
+    *,
+    confidence: float = 1.0,
+    evidence: list[dict] | None = None,
+) -> dict:
+    """Interpret every music request using the bounded read-only resolver."""
+    from .music import resolve
+    return resolve(ctx, text, confidence=confidence, evidence=evidence)
+
+
+def _genre_year_request(text: str) -> bool:
+    """True for a bounded genre + release-year playback request.
+
+    This shape has no artist identity to repair. Keep it deliberately narrow so
+    low-confidence artist/title requests still fail closed through the evidence
+    planner rather than leaking into raw Alexa dispatch.
+    """
+    return re.fullmatch(
+        r"\s*(?:play|put\s+on|put\s+some|play\s+some|play\s+me)\s+"
+        r"(?:some\s+)?[a-z][a-z0-9 &'’-]{0,40}\s+music\s+"
+        r"(?:from|in)\s+(?:19|20)\d{2}\s*[.!?]*\s*",
+        str(text),
+        re.IGNORECASE,
+    ) is not None
+
+
+def _evidence_agrees_verbatim(evidence: list[dict]) -> bool:
+    """Require two independent STT hypotheses with identical normalized text."""
+    if len(evidence) < 2:
+        return False
+
+    def normalized(value: object) -> str:
+        value = re.sub(r"[.!?]+$", "", str(value or "").strip())
+        return re.sub(r"\s+", " ", value).casefold()
+
+    texts = [normalized(row.get("text")) for row in evidence]
+    return bool(texts[0]) and all(value == texts[0] for value in texts[1:])
+
+
+_MUSIC_REDECODE_PROMPT = (
+    "This is a spoken music playback request. Transcribe the complete request "
+    "faithfully. Preserve every named performer and relationship word such as "
+    "and, with, featuring, or feat. Do not infer missing words."
+)
+
+
+def _collect_music_evidence(text: str, confidence: float, redecode=None) -> list[dict] | None:
+    """Gather one bounded artist-agnostic re-listen for low-confidence music.
+
+    Returns the immutable evidence packet, or None when a re-listen was
+    required (confidence below the repair floor) but could not be obtained.
+    Callers must treat None as insufficient evidence and fail closed to a
+    clarification rather than plan from a single degraded hypothesis.
+    """
+    evidence = [
+        {"text": str(text), "confidence": float(confidence), "source": "initial"}
+    ]
+    if confidence >= music.STT_REPAIR_CONFIDENCE_FLOOR or not callable(redecode):
+        return evidence
+    try:
+        # Bare, artist-agnostic re-listen. NO artist-candidate lookup happens
+        # before Jev selects the operation (the FLOOR-gated re-listen only
+        # recovers the words; routing decides what they mean).
+        second = redecode(initial_prompt=_MUSIC_REDECODE_PROMPT) or {}
+        if not isinstance(second, dict):
+            # Re-listening did not produce a usable hypothesis.
+            return None
+        second_text = str(second.get("text") or "").strip()
+        if not second_text:
+            return None
+        second_confidence = float(second.get("confidence", 0.0) or 0.0)
+        evidence.append(
+            {
+                "text": second_text,
+                "confidence": second_confidence,
+                "source": "music_domain_redecode",
+            }
+        )
+        events.emit(
+            "stt_redecode",
+            text=events.truncate(second_text),
+            confidence=round(second_confidence, 3),
+            source="music_domain_redecode",
+        )
+    except Exception as exc:
+        logger.warning("Music evidence re-decode failed: %s", exc)
+        events.emit("error", stage="music_redecode", detail=str(exc))
+        return None
+    return evidence
+
+
+def _is_clean_play_clause(text: str) -> bool:
+    """True for a single-clause play request with no embedded secondary action."""
+    if not text or not str(text).strip():
+        return False
+    if re.search(r"[;\r\n]|&&|\|\||[`$<>]", text):
+        return False
+    # A second imperative (stop, unlock, turn off, next...) after the music
+    # phrase is a chained/secondary action — do not forward as a play command.
+    remainder = re.sub(
+        r"^\s*(?:play|put\s+on|put\s+some|play\s+some|shuffle|play\s+me)\s+",
+        "", text, flags=re.IGNORECASE)
+    remainder = remainder.strip()
+    if not remainder:
+        return False
+    return not re.search(
+        r"\b(?:and|then|after|plus)\s+(?:play|stop|pause|unlock|turn\s+"
+        r"(?:on|off)|open|close|set)\b",
+        remainder,
+        re.IGNORECASE,
+    )
+
+
+def _normalize_provider(text: str) -> str:
+    """Pin a clean music phrase to the default provider, Apple Music."""
+    cleaned = re.sub(r"\s+on\s+(?:apple\s+)?music\s*$", "", text.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+on\s+\w[\w\s]*$", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"[.!?]+$", "", cleaned).strip()
+    if not cleaned:
+        return ""
+    return f"{cleaned} on Apple Music"
+
+
+def _dispatch_alexa_playback(playback_command: str, alexa_target: str) -> bool:
+    """Send a verified playback command to the configured Echo."""
+    from . import ha_conversation
+
+    playback = ha_conversation.play_alexa_media(playback_command, alexa_target)
+    if playback.get("ok"):
+        events.emit(
+            "route",
+            target="alexa_media",
+            outcome="handled",
+            targets=[alexa_target],
+        )
+        return True
+    events.emit(
+        "route",
+        target="alexa_media",
+        outcome="failed",
+        targets=[alexa_target],
+        detail=playback.get("error") or playback.get("reason"),
+    )
+    return False
+
+
+def _alexa_playback_return(
+    playback_command: str, alexa_target: str, ctx: Any, text: str
+) -> str:
+    """Acknowledge dispatch; reserve spoken confirmation for genuine failures.
+
+    In dry-run mode (HERMES_VOICE_DRY_RUN=1) the command is reported back as
+    speech instead of dispatched, so the operator can confirm what WOULD have
+    been sent to Alexa/Apple Music before letting it actually fire.
+    """
+    from .pipeline import SILENT_HANDLED
+
+    dry_run = os.getenv("HERMES_VOICE_DRY_RUN", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    if dry_run:
+        _write_playback_telemetry(False, playback_command, ctx, text)
+        return f"Dry run: I would ask Alexa to {playback_command}"
+
+    dispatched = _dispatch_alexa_playback(playback_command, alexa_target)
+    _write_playback_telemetry(dispatched, playback_command, ctx, text)
+    # Dispatch confirmed by HA success: playback itself is the acknowledgement.
+    # Speaking a second Alexa response here would interrupt the requested music.
+    if dispatched:
+        return SILENT_HANDLED
+    return "Alexa could not start that music."
+
+
+def _write_playback_telemetry(dispatched: bool, command: str, ctx: Any, text: str) -> None:
+    """Log dispatch (not playback confirmation) for later verification."""
+    try:
+        from . import music as _music
+
+        _music._write_telemetry({
+            "outcome": "dispatched" if dispatched else "dispatch_failed",
+            "command": command,
+            "source": text,
+        })
+    except Exception:
+        pass
+
+
+def _legacy_music_resolver_unused(ctx: Any, text: str) -> dict:
+    try:
+        result = ctx.llm.complete(
+            messages=[
+                {"role": "system", "content": MUSIC_RESOLVER_SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            max_tokens=120,
+            temperature=0.1,
+            purpose="voice_stack.music_resolver",
+        )
+        raw = str(getattr(result, "text", "") or "").strip()
+    except Exception as exc:
+        logger.warning("Music resolver unavailable: %s", exc)
+        events.emit(
+            "route",
+            target="music_resolver",
+            outcome="unavailable",
+            detail=str(exc),
+        )
+        return {"clarification": "Which song do you mean?"}
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
+    try:
+        result = json.loads(raw)
+    except (TypeError, ValueError):
+        return {"clarification": "Which song do you mean?"}
+    if not isinstance(result, dict):
+        return {"clarification": "Which song do you mean?"}
+
+    raw_command = str(result.get("command") or "")
+    if re.search(r"[;\r\n]|&&|\|\|", raw_command):
+        return {"clarification": "Which song do you mean?"}
+    command = " ".join(raw_command.split())
+    if 5 <= len(command) <= 200 and re.fullmatch(r"play\s+\S.+", command, re.IGNORECASE):
+        return {"command": command}
+
+    clarification = " ".join(str(result.get("clarification") or "").split())
+    if clarification:
+        return {"clarification": clarification[:160]}
+    return {"clarification": "Which song do you mean?"}
+
+
+def _route_voice_transcript(
+    ctx: Any,
+    text: str,
+    *,
+    language: str = "en",
+    confidence: float = 1.0,
+    redecode=None,
+) -> str:
     """Let native HA execute commands; use Hermes only for unmatched conversation."""
     from . import ha_conversation
 
@@ -359,7 +696,117 @@ def _route_voice_transcript(ctx: Any, text: str, *, language: str = "en") -> str
             )
             return f"I found {name}, but the channel did not switch."
 
-    if data.get("code") == "no_valid_targets":
+    # HA couldn't handle the request. Both "no_valid_targets" and
+    # "no_intent_match" mean the same thing here: no device/entity was matched.
+    # Music routing (regex fast path + Jev gate) must run for EITHER — a
+    # garbled "play Tove Lo" can land under either code depending on how HA's
+    # NLU fails, and skipping the gate silently drops the music path.
+    if data.get("code") in ("no_valid_targets", "no_intent_match"):
+
+        # Music routing: interpret EVERY music request into a precise,
+        # catalog-verified "… on Apple Music" command. Natural phrasing
+        # ("play", "put on", "put some", "shuffle") is recognized; media
+        # channels are handled earlier by the live-channel resolver.
+        music_match = re.fullmatch(
+            r"\s*(?:(?:play|put\s+on|put\s+some|play\s+some|shuffle|play\s+me)\s+(.+?)|(.+?\s+music))\s*",
+            text,
+            re.IGNORECASE,
+        )
+        alexa_target = os.getenv("HERMES_ALEXA_MEDIA_PLAYER", "").strip()
+        if music_match and alexa_target:
+            evidence = _collect_music_evidence(text, confidence, redecode)
+            if evidence is None:
+                # A re-listen was required (low confidence) but could not be
+                # obtained. Fail closed: never plan from a single degraded
+                # hypothesis. Ask the speaker to repeat instead.
+                return "I couldn't re-listen to that. Could you say it again?"
+
+            # A genre+year request has no artist slot. If the bare pass and the
+            # independent re-listen agree exactly, that consensus is stronger
+            # evidence than either confidence score and can be forwarded
+            # literally. Do this BEFORE artist planning; asking "which artist?"
+            # for "jazz music from 2026" is categorically wrong.
+            if _genre_year_request(text) and _evidence_agrees_verbatim(evidence):
+                raw = _normalize_provider(text)
+                if raw:
+                    events.emit(
+                        "music_resolver",
+                        outcome="genre_year_consensus",
+                        command=events.truncate(raw),
+                    )
+                    return _alexa_playback_return(raw, alexa_target, ctx, text)
+
+            resolution = _resolve_music_request(
+                ctx,
+                text,
+                confidence=confidence,
+                evidence=evidence,
+            )
+            # The resolver may fail closed to the exact UNAVAILABLE string
+            # (TypeSafe API down / no credential). Honor that string verbatim
+            # and do NOT fall back to a raw command — the contract is exact.
+            if isinstance(resolution, str):
+                return resolution
+            playback_command = str(resolution.get("command") or "").strip()
+            if playback_command:
+                return _alexa_playback_return(playback_command, alexa_target, ctx, text)
+            # Resolver could not produce a verified command. Only fall back to
+            # the exact words pinned to Apple Music when the transcript is
+            # trustworthy (high confidence) and clean. Below the repair floor
+            # the words are suspect — honor the clarification ("who did you
+            # mean?") instead of dispatching STT garbage verbatim.
+            if (
+                    confidence >= music.STT_REPAIR_CONFIDENCE_FLOOR
+                    and _is_clean_play_clause(text)
+                    and not _needs_music_resolution(text)
+                    and not music._latest_artist_name(text)
+                ):
+                    # Raw passthrough only for simple, unambiguous play clauses
+                    # ("play jazz", "play Nelly Furtado"). A "<latest> song/album
+                    # by <artist>" phrase embeds an artist that may be STT-garbled
+                    # and implies an online fresh-track lookup — never dispatch it
+                    # verbatim ("Play the latest song by Tuvalu …").
+                    raw = _normalize_provider(text)
+                    if raw:
+                        return _alexa_playback_return(raw, alexa_target, ctx, text)
+            return str(
+                resolution.get("clarification") or "Which song do you mean?"
+            )
+
+        # Jev music gate: the regex fast path missed. One system_one call
+        # decides music vs not, playback vs discussion — this catches
+        # STT-garbled music requests ("stay to the loop featuring stormlight")
+        # and music conversation, neither of which a regex can see. The gate
+        # runs even without an Alexa target: discussion needs no player.
+        if not music_match:
+            gate = _jev_music_gate(ctx, text)
+            if gate is None:
+                return music.UNAVAILABLE
+            is_music, wants_playback = gate
+            if is_music and wants_playback and alexa_target:
+                resolution = _resolve_music_request(
+                    ctx,
+                    text,
+                    confidence=confidence,
+                    evidence=_collect_music_evidence(text, confidence, redecode),
+                )
+                if isinstance(resolution, str):
+                    return resolution
+                playback_command = str(resolution.get("command") or "").strip()
+                if playback_command:
+                    return _alexa_playback_return(playback_command, alexa_target, ctx, text)
+                return str(
+                    resolution.get("clarification") or "Which song do you mean?"
+                )
+            if is_music and not wants_playback:
+                # Music discussion ("what has Stromae released?") → DJ Yakkuza.
+                events.emit(
+                    "route",
+                    target="music_profile",
+                    outcome="escalated",
+                    profile="music",
+                )
+                return _complete_voice_with_hermes(ctx, text, profile="music")
 
         match = re.fullmatch(r"\s*(?:turn|switch)\s+on\s+(.+?)\s*", text, re.IGNORECASE)
         if match:
@@ -483,19 +930,28 @@ def _handle_voice_enable(args: dict, **kw) -> str:
 
         config = _get_config()
         media_player = args.get("media_player_entity") or config["media_player_entity"] or None
+        alexa_media_player = config["alexa_media_player_entity"] or None
 
         from .pipeline import VoicePipeline
 
         # Define the callback that sends user text through Hermes's supported
         # plugin LLM facade. The pipeline runs in a background thread, so use
         # the synchronous facade rather than the async Assist receiver path.
-        def _voice_callback(text: str) -> str:
+        def _voice_callback(
+            text: str,
+            *,
+            confidence: float = 1.0,
+            audio_path: str | None = None,
+            redecode=None,
+        ) -> str:
             """Route STT text through native HA before Hermes conversation."""
             logger.info("Voice callback received: %s", text)
             if _plugin_ctx is None:
                 return "Hermes voice processing is unavailable."
             return _route_voice_transcript(
-                _plugin_ctx, text, language=config["stt"]["language"]
+                _plugin_ctx, text, language=config["stt"]["language"],
+                confidence=confidence,
+                redecode=redecode,
             )
 
         _pipeline = VoicePipeline(
@@ -504,11 +960,14 @@ def _handle_voice_enable(args: dict, **kw) -> str:
             stt_engine=_stt_engine,
             tts_engine=_tts_engine,
             media_player_entity=media_player,
+            alexa_media_player_entity=alexa_media_player,
             max_record_duration=config["max_record_duration"],
             silence_timeout=config["silence_timeout"],
             speech_threshold=config["stt"]["speech_threshold"],
+            record_gain=config["record_gain"],
             language=config["stt"]["language"],
             min_confidence=config["stt"]["min_confidence"],
+            follow_up_min_confidence=config["stt"]["follow_up_min_confidence"],
             wake_cooldown=config["wake_word"].get("cooldown", 5.0),
         )
 
@@ -592,7 +1051,11 @@ def _handle_voice_listen(args: dict, **kw) -> str:
         audio_path = tmp.name
 
     try:
-        recorded = record_audio(audio_path, duration=duration)
+        recorded = record_audio(
+            audio_path,
+            duration=duration,
+            gain=config.get("record_gain", 1.0),
+        )
         if not recorded:
             return json.dumps({"ok": False, "error": "No speech detected.", "error_category": "no_speech"})
         try:
@@ -634,16 +1097,181 @@ def _handle_voice_prompt(args: dict, **kw) -> str:
     return json.dumps({"ok": True, "prompt": prompt})
 
 
+ALEXA_AGENT_SYSTEM_PROMPT = (
+    "You are Hermes, answering through an Alexa skill via Home Assistant Assist. "
+    "Respond in one or two concise plain sentences suitable for speech. "
+    "Do not use markdown, lists, URLs, or file paths. "
+    "Use web or Home Assistant tools when they are needed to answer."
+)
+
+ALEXA_SESSION_ID = "alexa_hermes"
+ALEXA_SESSION_TITLE = "Voice (Alexa)"
+# Alexa cuts the session at ~8s; Lambda read timeout is 10s. An agent turn
+# that can't finish inside this budget gets an immediate spoken ack over
+# notify.alexa_media, and the real answer is spoken when it's ready.
+ALEXA_AGENT_BUDGET_SECONDS = float(os.getenv("HERMES_ALEXA_AGENT_BUDGET", "6.5"))
+ALEXA_SLOW_ACK = os.getenv("HERMES_ALEXA_SLOW_ACK", "On it — I'll have the answer on your speaker in a moment.")
+# Dedicated executor so slow Alexa runs never exhaust the loop's default
+# executor (shared with other plugin work).
+ALEXA_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="alexa-agent"
+)
+
+
+def _alexa_media_player() -> str:
+    """Resolve the Echo used for slow-answer delivery (same sink as Jarvis)."""
+    return os.getenv("HERMES_ALEXA_MEDIA_PLAYER", "").strip()
+
+
+def _resolve_last_called_media_player(timeout: float = 3.0) -> str:
+    """Ask HA which Echo Amazon last interacted with (alexa_media last_called).
+
+    At query time this is the Echo the user just spoke to, so answers land on
+    the asking device instead of a hardcoded one. Empty string when HA cannot
+    be reached or no device is flagged.
+    """
+    import urllib.request
+
+    hass_url = os.getenv("HASS_URL", "http://homeassistant.local:8123").rstrip("/")
+    hass_token = os.getenv("HASS_TOKEN", "")
+    if not hass_token:
+        return ""
+    template = (
+        "{{ states.media_player "
+        "| selectattr('attributes.last_called', 'eq', true) "
+        "| map(attribute='entity_id') | join(',') }}"
+    )
+    request = urllib.request.Request(
+        f"{hass_url}/api/template",
+        data=json.dumps({"template": template}).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {hass_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result = response.read().decode("utf-8").strip()
+        return result.split(",")[0].strip() if result else ""
+    except Exception as exc:
+        logger.warning("last_called lookup failed: %s", exc)
+        return ""
+
+
+def _deliver_slow_answer(text: str, target: Optional[str] = None) -> None:
+    """Speak a finished slow answer through notify.alexa_media (best effort)."""
+    from .pipeline import play_text_alexa
+
+    sink = (target or "").strip() or _alexa_media_player()
+    if not sink:
+        logger.warning("Slow Alexa answer ready but no target media_player resolved")
+        return
+    try:
+        ok = play_text_alexa(text, sink)
+        events.emit("spoken", sink=sink, attempt=1, slow=True, ok=ok)
+    except Exception:
+        logger.exception("Slow Alexa answer delivery failed")
+
+
+def _deliver_when_done(fut: "concurrent.futures.Future[str]", target: Optional[str] = None) -> None:
+    """Done-callback: speak the agent's answer once a slow turn completes."""
+    try:
+        response = fut.result()
+    except Exception:
+        return
+    response = (response or "").strip()
+    if response:
+        _deliver_slow_answer(response, target=target)
+
+
+def _deliver_when_done_with_target(
+    answer_future: "concurrent.futures.Future[str]",
+    target_future: "concurrent.futures.Future[str]",
+) -> None:
+    """Resolve the asking Echo and deliver without blocking the event loop."""
+    try:
+        target = target_future.result(timeout=3.5)
+    except Exception:
+        target = ""
+    _deliver_when_done(answer_future, target=target)
+
+
+def _schedule_slow_delivery(
+    answer_future: "concurrent.futures.Future[str]",
+    target_future: "concurrent.futures.Future[str]",
+) -> None:
+    """Move blocking target resolution and REST delivery off callback threads."""
+    threading.Thread(
+        target=_deliver_when_done_with_target,
+        args=(answer_future, target_future),
+        name="alexa-slow-delivery",
+        daemon=True,
+    ).start()
+
+
 async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    """Turn an HA Assist query into a Hermes LLM response.
+    """Turn an HA Assist query into a tool-capable Hermes agent response.
 
     This handles the HA-side ``assist_query`` message introduced by the
-    conversation platform. It intentionally uses ``ctx.llm`` rather than a
-    placeholder acknowledgement so Home Assistant receives a real spoken reply.
+    conversation platform (the Alexa skill path). It runs the same
+    tool-capable Sessions API agent as the wake-word path, but on its own
+    ``alexa_hermes`` session so the two pipelines keep separate histories.
+
+    The turn is raced against ``ALEXA_AGENT_BUDGET_SECONDS``: fast answers
+    return over the WebSocket inside Alexa's ~8s window; slow turns get an
+    immediate spoken ack through notify.alexa_media, and the finished answer
+    is spoken on the same Echo when the agent completes. The raw
+    ``concurrent.futures`` future is kept because ``asyncio.wait_for``
+    cancels its wrapper on timeout — the underlying thread keeps running
+    and delivers via ``add_done_callback``.
     """
     text = str(payload.get("text") or "").strip()
     language = str(payload.get("language") or "en")
     conversation_id = payload.get("conversation_id")
+
+    profile = _voice_profile_for(text)
+
+    target_cf = ALEXA_EXECUTOR.submit(_resolve_last_called_media_player)
+    cf = ALEXA_EXECUTOR.submit(
+        _run_full_agent,
+        text,
+        profile=profile,
+        session=ALEXA_SESSION_ID,
+        session_title=ALEXA_SESSION_TITLE,
+    )
+    try:
+        response_text = await asyncio.wait_for(
+            asyncio.shield(asyncio.wrap_future(cf)),
+            timeout=ALEXA_AGENT_BUDGET_SECONDS,
+        )
+        # Fast path: answer returns over the WebSocket (Alexa speaks it).
+        # No done-callback is attached, so there is no duplicate spoken
+        # delivery through notify.alexa_media.
+        return {
+            "ok": True,
+            "text": response_text,
+            "conversation_id": conversation_id,
+            "runner": "sessions api",
+            "profile": profile,
+        }
+    except asyncio.TimeoutError:
+        # Slow path: attach delivery to the still-running raw future — the
+        # asyncio wrapper was cancelled by wait_for, but the worker thread
+        # keeps going and the done-callback speaks the answer on the Echo.
+        # The ack itself is NOT re-spoken via notify: Alexa already speaks
+        # the WS ack response natively on the asking device.
+        cf.add_done_callback(lambda fut: _schedule_slow_delivery(fut, target_cf))
+        return {
+            "ok": True,
+            "text": ALEXA_SLOW_ACK,
+            "conversation_id": conversation_id,
+            "runner": "sessions api+slow_delivery",
+            "profile": profile,
+            "slow": True,
+        }
+    except Exception as exc:
+        logger.warning("Alexa tool-capable agent failed; falling back to raw LLM: %s", exc)
 
     result = await ctx.llm.acomplete(
         messages=[

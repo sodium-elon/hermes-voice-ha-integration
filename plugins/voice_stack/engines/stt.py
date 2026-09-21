@@ -103,12 +103,17 @@ class FasterWhisperEngine(STTEngine):
             )
         return self._model
 
-    def _transcribe_options(self, language: Optional[str]) -> Dict[str, Any]:
+    def _transcribe_options(self, language: Optional[str], hotwords: Optional[str] = None, initial_prompt: Optional[str] = None) -> Dict[str, Any]:
+        # Per-call overrides (used by the candidate-biased re-decode loop) layer
+        # over the construction-time values, letting the caller re-listen to the
+        # SAME audio biased toward repair candidates.
+        opts_hotwords = hotwords if hotwords is not None else self._hotwords
+        opts_prompt = initial_prompt if initial_prompt is not None else self._initial_prompt
         options: Dict[str, Any] = {
             "language": language,
             "beam_size": 5,
-            "initial_prompt": self._initial_prompt,
-            "hotwords": self._hotwords,
+            "initial_prompt": opts_prompt,
+            "hotwords": opts_hotwords,
             "vad_filter": self._vad_filter,
             "condition_on_previous_text": self._condition_on_previous_text,
         }
@@ -122,17 +127,17 @@ class FasterWhisperEngine(STTEngine):
             options.update(extra)
         return options
 
-    def transcribe(self, audio_path: str, language: Optional[str] = None) -> str:
+    def transcribe(self, audio_path: str, language: Optional[str] = None, *, hotwords: Optional[str] = None, initial_prompt: Optional[str] = None) -> str:
         model = self._get_model()
         segments, info = model.transcribe(
-            audio_path, **self._transcribe_options(language)
+            audio_path, **self._transcribe_options(language, hotwords, initial_prompt)
         )
         return " ".join(seg.text.strip() for seg in segments)
 
-    def transcribe_with_confidence(self, audio_path: str, language: Optional[str] = None) -> Dict[str, Any]:
+    def transcribe_with_confidence(self, audio_path: str, language: Optional[str] = None, *, hotwords: Optional[str] = None, initial_prompt: Optional[str] = None) -> Dict[str, Any]:
         model = self._get_model()
         segments, info = model.transcribe(
-            audio_path, **self._transcribe_options(language)
+            audio_path, **self._transcribe_options(language, hotwords, initial_prompt)
         )
         segment_list = list(segments)
         if not segment_list:

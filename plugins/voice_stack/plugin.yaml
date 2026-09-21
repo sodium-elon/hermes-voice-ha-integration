@@ -31,6 +31,13 @@ config:
     type: bool
     default: false
     description: Start continuous wake-word listening when the plugin loads
+  HERMES_FOLLOW_UP_TIMEOUT:
+    type: int
+    default: 6
+    description: >-
+      Seconds a follow-up (armed) window waits for the user's quick answer
+      before giving up and returning to normal wake-word listening. The wake
+      word itself is always armed and never times out.
 
   # Wake Word engine: porcupine, openwakeword, command
   HERMES_WAKE_WORD_ENGINE:
@@ -67,7 +74,22 @@ config:
   HERMES_WAKE_BEEP_DURATION:
     type: float
     default: 0.60
-    description: Wake cue duration in seconds; HDMI outputs may swallow very short tones
+    description: Wake cue duration in seconds when HERMES_WAKE_CUE_OUTPUT is local
+  HERMES_WAKE_CUE_OUTPUT:
+    type: str
+    default: local
+    description: Wake cue route; local uses fire-and-forget ffplay, alexa uses a bounded synchronous announcement dispatch
+  HERMES_WAKE_CUE_TEXT:
+    type: str
+    default: ""
+    description: Optional text after the Alexa announcement chime; empty sends a punctuation-only announcement for chime-only mode
+  HERMES_WAKE_CUE_SETTLE_SECONDS:
+    type: float
+    default: 2.5
+    description: >-
+      Delay after Alexa accepts the wake cue before command recording begins,
+      allowing the remote Echo chime to become audible without consuming the
+      fixed speech-capture window; ignored for local/disabled cues
 
   # STT engine: faster-whisper, whisper-cpp, command
   HERMES_STT_ENGINE:
@@ -98,6 +120,10 @@ config:
     type: float
     default: 0.15
     description: Silently discard hallucinated transcripts below this confidence floor
+  HERMES_STT_FOLLOW_UP_MIN_CONFIDENCE:
+    type: float
+    default: 0.02
+    description: Lower confidence floor for short answers inside an already-armed follow-up turn
   HERMES_STT_CONDITION_ON_PREVIOUS_TEXT:
     type: bool
     default: false
@@ -114,6 +140,10 @@ config:
     type: float
     default: 0.005
     description: Recorder RMS floor; keep low and let VAD classify speech
+  HERMES_RECORD_GAIN:
+    type: float
+    default: 1.0
+    description: Software gain (>1.0) applied to captured samples before STT; rescues a locked-low OS mic input level
 
   # TTS engine: edge, piper, command
   HERMES_TTS_ENGINE:
@@ -129,7 +159,11 @@ config:
   HERMES_MEDIA_PLAYER:
     type: str
     default: ""
-    description: HA media_player entity for TTS output (leave empty for local speakers)
+    description: HA media_player entity for generated-audio playback (leave empty for local speakers)
+  HERMES_ALEXA_MEDIA_PLAYER:
+    type: str
+    default: ""
+    description: Alexa media_player target for notify.alexa_media text-to-speech; overrides generated-audio playback
 
   # Pipeline
   HERMES_RECORD_DURATION:

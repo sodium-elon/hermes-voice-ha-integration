@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import concurrent.futures
+import json
 import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -17,16 +20,27 @@ _DEFAULT_AGENT = "conversation.home_assistant"
 _CONVERSATION_TIMEOUT = 15.0
 _CHANNEL_VERIFY_TIMEOUT = 10.0
 _CHANNEL_MEDIA_PLAYER = "media_player.firedroid"
+_MEDIA_SERVICE_TIMEOUT = 10.0
 _THREAD_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=2, thread_name_prefix="voice-ha-conversation-"
 )
 
 
 def _get_config() -> tuple[str, str]:
-    return (
-        os.getenv("HASS_URL", _DEFAULT_URL).rstrip("/"),
-        os.getenv("HASS_TOKEN", ""),
-    )
+    url = os.getenv("HASS_URL", "")
+    token = os.getenv("HASS_TOKEN", "")
+    if not token:
+        # Profile gateways do not inherit the default profile's .env. Reuse the
+        # machine-local HA credentials without copying secrets between profiles.
+        try:
+            from dotenv import dotenv_values
+
+            shared = dotenv_values(Path.home() / ".hermes" / ".env")
+            url = url or str(shared.get("HASS_URL") or "")
+            token = str(shared.get("HASS_TOKEN") or "")
+        except Exception:
+            pass
+    return ((url or _DEFAULT_URL).rstrip("/"), token)
 
 
 def _run_async(coro):
@@ -89,6 +103,44 @@ def process_conversation(
     except Exception as exc:
         logger.error("HA conversation processing failed: %s", exc)
         return {"error": f"Home Assistant conversation failed: {exc}"}
+
+
+async def _async_play_alexa_media(command: str, target: str) -> Dict[str, Any]:
+    """Send an Alexa custom media command through Home Assistant."""
+    import aiohttp
+
+    url, token = _get_config()
+    if not token:
+        raise RuntimeError("HASS_TOKEN is not configured")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "entity_id": target,
+        "media_content_type": "custom",
+        "media_content_id": command,
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{url}/api/services/media_player/play_media",
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=_MEDIA_SERVICE_TIMEOUT),
+        ) as response:
+            response.raise_for_status()
+            await response.read()
+    return {"ok": True, "target": target, "command": command}
+
+
+def play_alexa_media(command: str, target: str) -> Dict[str, Any]:
+    """Run an Alexa custom media command from the background voice thread."""
+    try:
+        return _run_async(_async_play_alexa_media(command, target))
+    except Exception as exc:
+        logger.error("Alexa media playback failed: %s", exc)
+        return {"ok": False, "reason": "ha_error", "error": str(exc)}
 
 
 _NUMBER_WORDS = {
@@ -212,3 +264,20 @@ def run_live_channel(target: str) -> Dict[str, Any]:
     except Exception as exc:
         logger.error("Live HA channel execution failed: %s", exc)
         return {"ok": False, "reason": "ha_error", "error": str(exc)}
+
+
+def _main() -> int:
+    parser = argparse.ArgumentParser(description="Home Assistant voice-stack client")
+    parser.add_argument("--script", choices=("play_alexa_media",), required=True)
+    parser.add_argument("--text", required=True)
+    parser.add_argument("--target", default=os.getenv("HERMES_ALEXA_MEDIA_PLAYER", ""))
+    args = parser.parse_args()
+    if not args.target:
+        parser.error("--target or HERMES_ALEXA_MEDIA_PLAYER is required")
+    result = play_alexa_media(args.text, args.target)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
