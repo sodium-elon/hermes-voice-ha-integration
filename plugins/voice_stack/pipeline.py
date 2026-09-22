@@ -434,11 +434,26 @@ def play_text_alexa(
     """Speak text through Alexa Media Player's notify TTS REST service."""
     import urllib.request
 
-    hass_url = os.getenv("HASS_URL", "http://homeassistant.local:8123").rstrip("/")
+    hass_url = os.getenv("HASS_URL", "").rstrip("/")
     hass_token = os.getenv("HASS_TOKEN", "")
+    if not hass_token:
+        # Profile gateways do not inherit the default profile's .env. Reuse the
+        # machine-local HA credentials without copying secrets between profiles
+        # (same fallback as ha_conversation._get_config).
+        try:
+            from dotenv import dotenv_values
+
+            shared = dotenv_values(Path.home() / ".hermes" / ".env")
+            hass_url = hass_url or str(shared.get("HASS_URL") or "")
+            hass_token = str(shared.get("HASS_TOKEN") or "")
+        except Exception:
+            pass
+    if not hass_url:
+        hass_url = "http://homeassistant.local:8123"
     if not hass_token:
         logger.error("HASS_TOKEN is not configured — cannot use Alexa TTS")
         return False
+    hass_url = hass_url.rstrip("/")
 
     payload = json.dumps({
         "message": text,

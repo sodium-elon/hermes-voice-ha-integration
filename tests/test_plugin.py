@@ -1546,6 +1546,50 @@ class TestPipelineState:
             "data": {"type": "tts"},
         }
 
+    def test_alexa_notify_tts_falls_back_to_hermes_dotenv_when_env_unset(
+        self, monkeypatch, tmp_path
+    ):
+        """Without HASS_URL/HASS_TOKEN in the process env, play_text_alexa
+        should fall back to ~/.hermes/.env (same pattern as
+        ha_conversation._get_config) instead of failing silently."""
+        import urllib.request
+
+        from plugins.voice_stack import pipeline
+
+        (tmp_path / ".hermes").mkdir()
+        (tmp_path / ".hermes" / ".env").write_text(
+            "HASS_URL=http://fallback-ha.local:8123\nHASS_TOKEN=dotenv-token\n"
+        )
+
+        calls = []
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b"[]"
+
+        def fake_urlopen(req, timeout):
+            calls.append((req, timeout))
+            return FakeResponse()
+
+        monkeypatch.delenv("HASS_URL", raising=False)
+        monkeypatch.delenv("HASS_TOKEN", raising=False)
+        monkeypatch.setattr(pipeline.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        assert pipeline.play_text_alexa("Hello", "media_player.john_s_echo_5th_right") is True
+        assert len(calls) == 1
+        request, _ = calls[0]
+        assert request.full_url == "http://fallback-ha.local:8123/api/services/notify/alexa_media"
+        assert request.get_header("Authorization") == "Bearer dotenv-token"
+
     def test_audio_playback_timeout_exceeds_generated_clip_duration(self, monkeypatch):
         from plugins.voice_stack import pipeline
 
