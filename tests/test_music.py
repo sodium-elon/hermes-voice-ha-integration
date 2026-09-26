@@ -133,6 +133,34 @@ def test_artist_not_in_catalog_prompts_clarification(monkeypatch):
     assert "clarification" in out
 
 
+def test_garbled_artist_resolve_falls_back_to_db_before_clarifying(monkeypatch):
+    """Single-artist resolve that misses the catalog must try the DB (fame/pop)
+    recovery before punting to a repeat. John's directive: when one way fails,
+    try the other way. Here the exact catalog resolve miss ("Bill McCartney"
+    garble) must fall back to a DB candidate that surfaces the real artist
+    ("Dolly Parton") and play it, not ask for a repeat."""
+    from plugins.voice_stack import music
+
+    # Exact catalog resolve on the misheard name finds nothing.
+    mock_catalog(monkeypatch, lambda kw: [])
+    set_route(monkeypatch, {
+        "operation": "artist", "artist": "Bill McCartney",
+        "title": "", "secondary": "", "confidence": 0.95,
+    })
+    # The DB-backed recovery surfaces the real artist and Jev picks her.
+    monkeypatch.setattr(
+        music, "_artist_db_fallback",
+        lambda artist, confidence: {
+            "command": "Play songs by Dolly Parton on Apple Music"
+        },
+        raising=False,
+    )
+
+    out = _resolve_music_request(context(), "Play a song by Bill McCartney")
+
+    assert out == {"command": "Play songs by Dolly Parton on Apple Music"}
+
+
 # ---------------------------------------------------------------------------
 # Song requests — Words vs Titanic discrimination
 # ---------------------------------------------------------------------------

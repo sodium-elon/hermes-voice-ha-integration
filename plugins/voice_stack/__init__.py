@@ -313,12 +313,93 @@ def _voice_profile_for(text: str) -> Optional[str]:
     return None
 
 
-def _jev_music_gate(ctx: Any, text: str):
-    """One system_one call: is this music, and is it a playback request?
+# Provisional specialist-routing floor. Only a confident Jev Choice routes to a
+# specialist; ambiguity degrades to the general agent. Not a calibrated claim.
+ASSIST_ROUTE_FLOOR = 0.6
 
-    Returns (is_music, wants_playback) or None on outage. The regex fast path
-    covers verb-led requests; this gate catches the rest ("stay to the loop
-    featuring stormlight") that regexes cannot see.
+
+def _route_assist_profile(text: str) -> Optional[str]:
+    """Choose the specialist profile for a text relay, or None for the general agent.
+
+    A cheap regex first resolves the well-worn running-data phrasing straight to
+    sportscoach (no Jev round-trip). Everything else goes to one Jev Choice over
+    {sportscoach, music, neither}; only a confident specialist answer routes.
+    Ambiguity, a missing key, or a Jev outage fall back to the general agent —
+    never a wrong specialist. This is forwarding only: no DB, no playback.
+    """
+    regex_profile = _voice_profile_for(text)
+    if regex_profile:
+        return regex_profile
+    return _jev_route_specialist(text)
+
+
+def _jev_route_specialist(text: str) -> Optional[str]:
+    """One Jev Choice: which specialist owns this request? None on ambiguity/outage."""
+    from typesafe_sdk import Choice, TypeSafeClient
+
+    key = music._load_api_key()
+    if not key:
+        return None  # no credential => general agent, never a wrong specialist
+
+    criteria = {
+        "sportscoach": (
+            "Sports or fitness: running, workouts, races, Garmin/AlphaRunner "
+            "stats, personal records, training data, pace, distance, heart rate."
+        ),
+        "music": (
+            "Music: playing, discussing, recommending, or asking about music, "
+            "artists, albums, songs, playlists, or genres."
+        ),
+        "neither": (
+            "Anything else: household/device commands, weather, news, timers, "
+            "general questions, or requests unrelated to sports or music."
+        ),
+    }
+    try:
+        with TypeSafeClient(api_key=key) as client:
+            response = client.system_one(
+                model="jev-latest",
+                state={
+                    "request": text,
+                    "note": (
+                        "A spoken voice request relayed through Home Assistant, "
+                        "possibly with imperfect transcription."
+                    ),
+                },
+                questions={
+                    "route": Choice(
+                        instructions=(
+                            "Which specialist should own this request? Choose "
+                            "sportscoach for sports/fitness, music for music, "
+                            "neither if no specialist applies."
+                        ),
+                        criteria=criteria,
+                    )
+                },
+            )
+    except Exception:
+        return None
+
+    answer = response.answers["route"]
+    choice = str(getattr(answer, "choice", "") or "neither")
+    if choice not in ("sportscoach", "music"):
+        return None
+    try:
+        confidence = float(getattr(answer, "confidence", 0))
+    except (TypeError, ValueError):
+        return None
+    if confidence < ASSIST_ROUTE_FLOOR:
+        return None
+
+    events.emit("route", target=choice, confidence=confidence, source="assist_relay")
+    return choice
+
+
+def _jev_music_gate(ctx: Any, text: str):
+    """One Jev judgment: is this music-related? None means service unavailable.
+
+    The second tuple position is a legacy text-only routing compatibility slot;
+    live recorded voice turns only consume the music decision.
     """
     try:
         from typesafe_sdk import Noul, TypeSafeClient
@@ -347,23 +428,15 @@ def _jev_music_gate(ctx: Any, text: str):
                             "or songs? Consider garbled speech-transcription."
                         )
                     ),
-                    "playback": Noul(
-                        instructions=(
-                            "Is the user asking to start music playback now — play "
-                            "a song, artist, album, genre, or playlist?"
-                        )
-                    ),
                 },
             )
         is_music = float(response.answers["music"].noul) >= 0.5
-        wants_playback = float(response.answers["playback"].noul) >= 0.5
         events.emit(
             "route",
             target="jev_music_gate",
             outcome="music" if is_music else "not_music",
-            playback=wants_playback,
         )
-        return (is_music, wants_playback)
+        return (is_music, False)
     except Exception:
         return None
 
@@ -630,9 +703,51 @@ def _route_voice_transcript(
     language: str = "en",
     confidence: float = 1.0,
     redecode=None,
+    audio_path: str | None = None,
+    _music_decided: bool = False,
 ) -> str:
-    """Let native HA execute commands; use Hermes only for unmatched conversation."""
-    from . import ha_conversation
+    """Route a recorded music turn directly to DJ; HA owns nonmusic turns."""
+    from . import ha_conversation, music
+
+    if audio_path:
+        from . import music_handoff, dj_audio
+        import math
+
+        recording = os.path.realpath(audio_path)
+        if not os.path.isfile(recording):
+            return "I couldn't access the recording. Please try again."
+        try:
+            acoustic_confidence = float(confidence)
+        except (ValueError, TypeError):
+            acoustic_confidence = 0.0
+        if not math.isfinite(acoustic_confidence) or not 0 <= acoustic_confidence <= 1:
+            acoustic_confidence = 0.0
+        low_confidence = acoustic_confidence < _get_config()["stt"]["min_confidence"]
+        hypotheses = [{"text": text, "source": "initial_stt", "confidence": acoustic_confidence}]
+        if low_confidence:
+            try:
+                alternate = dj_audio.transcribe_recording(recording)
+                if alternate:
+                    hypotheses.append({"text": alternate, "source": "same_wav_medium_stt"})
+                    events.emit("stt_redecode", source="music_gate", text=events.truncate(alternate))
+            except Exception as exc:
+                # A failed alternate does not erase the original evidence.
+                logger.warning("Music gate alternate transcription failed: %s", exc)
+        try:
+            decision = music_handoff.decide(hypotheses)
+        except music.TypeSafeUnavailable:
+            return music.UNAVAILABLE
+        if decision["route"] == "music":
+            events.emit("route", target="music_profile", outcome="recording_handoff",
+                        profile="music", probability=decision["probability"])
+            return _complete_voice_with_hermes(
+                ctx, music_handoff.build_prompt(recording, decision), profile="music")
+        if decision["route"] == "uncertain" or low_confidence:
+            return "I couldn't hear that clearly. Could you repeat it?"
+        # Explicit nonmusic decision: retain HA/general handling, but never
+        # re-enter the historical regex/resolver music path after an HA miss.
+        return _route_voice_transcript(
+            ctx, text, language=language, confidence=confidence, _music_decided=True)
 
     result = ha_conversation.process_conversation(
         text,
@@ -713,7 +828,7 @@ def _route_voice_transcript(
             re.IGNORECASE,
         )
         alexa_target = os.getenv("HERMES_ALEXA_MEDIA_PLAYER", "").strip()
-        if music_match and alexa_target:
+        if music_match and alexa_target and not _music_decided:
             evidence = _collect_music_evidence(text, confidence, redecode)
             if evidence is None:
                 # A re-listen was required (low confidence) but could not be
@@ -778,7 +893,7 @@ def _route_voice_transcript(
         # STT-garbled music requests ("stay to the loop featuring stormlight")
         # and music conversation, neither of which a regex can see. The gate
         # runs even without an Alexa target: discussion needs no player.
-        if not music_match:
+        if not music_match and not _music_decided:
             gate = _jev_music_gate(ctx, text)
             if gate is None:
                 return music.UNAVAILABLE
@@ -952,6 +1067,7 @@ def _handle_voice_enable(args: dict, **kw) -> str:
                 _plugin_ctx, text, language=config["stt"]["language"],
                 confidence=confidence,
                 redecode=redecode,
+                audio_path=audio_path,
             )
 
         _pipeline = VoicePipeline(
@@ -968,6 +1084,7 @@ def _handle_voice_enable(args: dict, **kw) -> str:
             language=config["stt"]["language"],
             min_confidence=config["stt"]["min_confidence"],
             follow_up_min_confidence=config["stt"]["follow_up_min_confidence"],
+            route_low_confidence=True,
             wake_cooldown=config["wake_word"].get("cooldown", 5.0),
         )
 
@@ -1230,7 +1347,7 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
     language = str(payload.get("language") or "en")
     conversation_id = payload.get("conversation_id")
 
-    profile = _voice_profile_for(text)
+    profile = _route_assist_profile(text)
 
     target_cf = ALEXA_EXECUTOR.submit(_resolve_last_called_media_player)
     cf = ALEXA_EXECUTOR.submit(

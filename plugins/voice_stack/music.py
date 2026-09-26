@@ -238,6 +238,77 @@ def _resolve_artist(intent, name):
     return {"command": f"Play songs by {canonical} on Apple Music"}
 
 
+def _artist_db_fallback(artist, confidence):
+    """Recover a garbled-yet-confident single artist from DB + listening vocab.
+
+    Whisper can be 10/10 confident on a name that is physically wrong
+    ("Bill McCartney" for "Dolly Parton"). Because confidence clears the
+    repair floor, the low-confidence path never fires, and when the exact
+    catalog resolve also misses, the old code punted straight to a repeat ask.
+    That is the ``asked again`` loop the user hit.
+
+    This runs on that miss and tries the other way: it hands Jev the FULL
+    owner listening vocabulary (never starved by a file-order quota, so Dolly
+    at line 18 is always in the pool) plus DB phonetic anchors, and only emits
+    a command when Jev picks a real, confident artist that actually resolves
+    in the catalog. Returns a command dict, or None to fall through to CLARIFY.
+    """
+    suspect = _safe_name(artist) or ""
+    if not suspect:
+        return None
+    # Only recover when the STT side was actually confident. If the utterance
+    # was clearly garbled/low-confidence, asking for a repeat stays correct.
+    if confidence < STT_REPAIR_CONFIDENCE_FLOOR:
+        return None
+    cands, seen = [], set()
+
+    def add(name):
+        name = _safe_name(name)
+        if not name:
+            return
+        key = name.casefold()
+        if key not in seen:
+            seen.add(key)
+            cands.append(name)
+
+    # 1. Full listening vocabulary first — all entries, not a quota, so the
+    #    owner's real artists (incl. Dolly at line 18) can never be starved.
+    for name in _load_artist_vocabulary():
+        add(name)
+    # 2. DB phonetic anchors on the suspect fill in any gap and anchor Jev to
+    #    the sounds actually spoken.
+    try:
+        indexed = _duckdb_artist_candidates(suspect, limit=12) or _postgres_artist_candidates(suspect, limit=12)
+        for name in indexed:
+            add(name)
+    except Exception:
+        pass
+    cands = [c for c in cands if c.casefold() != suspect.casefold()]
+    cands = cands[:24]
+    if len(cands) < 2:
+        return None
+    state = {"transcript": suspect, "suspect_term": suspect, "candidates": cands}
+    try:
+        chosen, conf = _jev_select_artist(state, None, cands)
+    except TypeSafeUnavailable:
+        # Best-effort recovery: without Jev we cannot distinguish a garbled name
+        # from a genuinely unknown one. Degrade to clarification (ask again)
+        # rather than guessing — never worse than the prior behaviour.
+        return None
+    except Exception:
+        return None
+    if chosen == "none" or conf < STT_REPAIR_MIN_CHOICE_CONFIDENCE:
+        return None
+    resolved = _resolve_artist(
+        {"shuffle": False, "research": False, "latest": False, "studio": False},
+        chosen,
+    )
+    if resolved:
+        return resolved
+    # Chosen artist is not in the live catalog; do not fabricate a fact.
+    return None
+
+
 def _resolve_song(intent, title, artist):
     title = (title or "").strip()
     artist = (artist or "").strip()

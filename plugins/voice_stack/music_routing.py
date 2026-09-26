@@ -159,6 +159,14 @@ def execute(route, text, confidence, *, followup=None, wake_id=None):
     elif op == 'artist':
         lookup = 'itunes_exact_artist'
         result = music._resolve_artist(intent, artist)
+        if not result:
+            # The exact catalog resolve missed. When one way fails, try the
+            # other before asking for a repeat: the garble may be confidently
+            # wrong ("Bill McCartney" for "Dolly Parton"), so recover from the
+            # DB + full listening vocabulary. Nothing to gain from a round of
+            # 'wrong word' paraphrase that cannot cross the phonetic gap.
+            lookup = 'db_vocab_artist_fallback'
+            result = music._artist_db_fallback(artist, confidence)
     elif op == 'named_song':
         lookup = 'itunes_exact_title_and_artist'
         result = music._resolve_song(intent, route.get('title', ''), artist)

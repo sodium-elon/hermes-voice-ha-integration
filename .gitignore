@@ -38,3 +38,6 @@ local-config.yaml
 # Build artifacts
 *.tar.gz
 *.zip
+
+# Agent planner scratch (local only)
+.hermes/

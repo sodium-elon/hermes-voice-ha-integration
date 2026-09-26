@@ -1256,6 +1256,32 @@ class TestPipelineState:
 
         assert len(callback_calls) == 1
 
+    def test_opted_in_voice_callback_sees_low_confidence_wav_before_cleanup(self, monkeypatch):
+        from plugins.voice_stack import pipeline as pipeline_module
+        from plugins.voice_stack.pipeline import VoicePipeline
+        import os
+
+        seen = []
+        class FakeSTT:
+            def available(self): return True
+            def transcribe_with_confidence(self, _path, language=None):
+                voice_pipeline.state.enabled = False
+                return {"text": "Thanks for watching.", "confidence": 0.087}
+        class FakeTTS:
+            def available(self): return True
+        def callback(text, *, confidence, audio_path, redecode):
+            seen.append((text, confidence, os.path.exists(audio_path)))
+            return pipeline_module.SILENT_HANDLED
+        voice_pipeline = VoicePipeline(
+            callback=callback, stt_engine=FakeSTT(), tts_engine=FakeTTS(),
+            min_confidence=0.15, route_low_confidence=True,
+        )
+        voice_pipeline.state.enabled = True
+        monkeypatch.setattr(pipeline_module, "record_audio", lambda *_a, **_k: True)
+        monkeypatch.setattr(voice_pipeline, "_speak", lambda *_a: (_ for _ in ()).throw(AssertionError("no TTS")))
+        voice_pipeline._run_loop()
+        assert seen == [("Thanks for watching.", 0.087, True)]
+
     def test_hallucination_below_confidence_floor_is_silently_dropped(self, monkeypatch):
         from plugins.voice_stack import pipeline as pipeline_module
         from plugins.voice_stack.pipeline import VoicePipeline
@@ -1708,6 +1734,17 @@ class TestPipelineState:
         ]
         assert local_calls == []
 
+    @pytest.mark.parametrize("accepted", [True, False])
+    def test_wake_cue_records_alexa_dispatch_result(self, monkeypatch, accepted):
+        from plugins.voice_stack import pipeline
+        outcomes = []
+        monkeypatch.setenv("HERMES_WAKE_CUE_OUTPUT", "alexa")
+        monkeypatch.setenv("HERMES_ALEXA_MEDIA_PLAYER", "media_player.test")
+        monkeypatch.setattr(pipeline, "play_text_alexa", lambda *_a, **_k: accepted)
+        monkeypatch.setattr(pipeline.events, "emit", lambda kind, **kw: outcomes.append((kind, kw)))
+        pipeline._play_wake_beep_blocking()
+        assert outcomes == [("wake_cue", {"target": "media_player.test", "accepted": accepted})]
+
     def test_alexa_wake_cue_dispatch_is_synchronous(self, monkeypatch):
         from plugins.voice_stack import pipeline
 
@@ -1839,6 +1876,7 @@ class TestVoicePluginInit:
         assert captured["alexa_media_player_entity"] == (
             "media_player.john_s_echo_5th_right"
         )
+        assert captured["route_low_confidence"] is True
         voice_stack._pipeline = None
 
     def test_register_auto_enables_voice_when_requested(self, monkeypatch):
@@ -2916,6 +2954,147 @@ class TestVoiceLifecycleRobustness:
         )
 
         assert response == "Sports Coach is unavailable right now."
+
+    def test_low_confidence_voice_uses_recording_for_jev_before_dj(self, monkeypatch, tmp_path):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import dj_audio, ha_conversation
+
+        wav = tmp_path / "request.wav"
+        wav.write_bytes(b"RIFF-test")
+        monkeypatch.setattr(dj_audio, "transcribe_recording", lambda path: "Face the beaters.")
+        seen = []
+        from plugins.voice_stack import music_handoff
+        monkeypatch.setattr(music_handoff, "judge_music", lambda state: (seen.append(state["hypotheses"]), 0.9)[1])
+        monkeypatch.setattr(ha_conversation, "process_conversation", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("HA bypass")))
+        monkeypatch.setattr(voice_stack, "_run_full_agent", lambda prompt, *, profile: (
+            seen.append((prompt, profile)), "DJ received recording."
+        )[1])
+        assert voice_stack._route_voice_transcript(
+            object(), "Thanks for watching.", confidence=0.087, audio_path=str(wav)
+        ) == "DJ received recording."
+        assert [h["text"] for h in seen[0]] == ["Thanks for watching.", "Face the beaters."]
+        assert seen[1][1] == "music" and str(wav) in seen[1][0]
+
+    @pytest.mark.parametrize("candidate, decision", [
+        ("Please don't attack me.", (False, False)),
+        ("", (False, False)),
+    ])
+    def test_low_confidence_without_music_evidence_never_calls_ha_or_dj(
+        self, monkeypatch, tmp_path, candidate, decision
+    ):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import dj_audio, ha_conversation
+        wav = tmp_path / "request.wav"
+        wav.write_bytes(b"RIFF-test")
+        monkeypatch.setattr(dj_audio, "transcribe_recording", lambda path: candidate)
+        from plugins.voice_stack import music_handoff
+        monkeypatch.setattr(music_handoff, "judge_music", lambda state: 0.1)
+        monkeypatch.setattr(ha_conversation, "process_conversation", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("HA bypass")))
+        monkeypatch.setattr(voice_stack, "_run_full_agent", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("DJ bypass")))
+        assert "repeat" in voice_stack._route_voice_transcript(
+            object(), "Thanks for watching.", confidence=0.087, audio_path=str(wav)
+        ).lower()
+
+    def test_music_recording_goes_to_dj_before_ha_or_resolver(self, monkeypatch, tmp_path):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation
+
+        wav = tmp_path / "request.wav"
+        wav.write_bytes(b"RIFF-audio-test")
+        gate_calls, handoffs = [], []
+        from plugins.voice_stack import music_handoff
+        monkeypatch.setattr(music_handoff, "judge_music", lambda state: (gate_calls.append(state["hypotheses"][0]["text"]), 0.9)[1])
+        monkeypatch.setattr(ha_conversation, "process_conversation", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("HA must not preempt DJ")))
+        monkeypatch.setattr(voice_stack, "_resolve_music_request", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("old resolver must not run")))
+        def dj(prompt, *, profile=None):
+            handoffs.append((prompt, profile, wav.exists()))
+            return "Handled by DJ."
+        monkeypatch.setattr(voice_stack, "_run_full_agent", dj)
+
+        result = voice_stack._route_voice_transcript(
+            object(), "Play Dolly Parton", audio_path=str(wav)
+        )
+        assert result == "Handled by DJ."
+        assert gate_calls == ["Play Dolly Parton"]
+        assert len(handoffs) == 1
+        assert handoffs[0][1:] == ("music", True)
+        assert str(wav) in handoffs[0][0]
+
+    @pytest.mark.parametrize("gate, expected", [
+        ((False, False), "Done."),
+        (None, "TypeSafe API (Jev)  is unavailable"),
+    ])
+    def test_recorded_nonmusic_or_jev_outage_never_reaches_dj(
+        self, monkeypatch, tmp_path, gate, expected
+    ):
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import ha_conversation, music
+
+        wav = tmp_path / "request.wav"
+        wav.write_bytes(b"RIFF-test")
+        from plugins.voice_stack import music_handoff
+        def judge(state):
+            if gate is None:
+                raise music.TypeSafeUnavailable(music.UNAVAILABLE)
+            return 0.1
+        monkeypatch.setattr(music_handoff, "judge_music", judge)
+        calls = []
+        monkeypatch.setattr(ha_conversation, "process_conversation", lambda *_a, **_k: (
+            calls.append("ha") or {"response": {"response_type": "success"}}
+        ))
+        monkeypatch.setattr(voice_stack, "_run_full_agent", lambda *_a, **_k: (
+            _ for _ in ()
+        ).throw(AssertionError("must not reach DJ")))
+        assert voice_stack._route_voice_transcript(
+            object(), "Turn off the bedroom lights", audio_path=str(wav)
+        ) == (music.UNAVAILABLE if gate is None else expected)
+        assert calls == ([] if gate is None else ["ha"])
+
+    def test_dj_audio_reader_rejects_non_wav_and_transcribes_shared_recording(self, tmp_path):
+        from plugins.voice_stack import dj_audio
+
+        wav = tmp_path / "music.wav"
+        wav.write_bytes(b"RIFF" + b"\x00" * 4 + b"WAVE")
+        calls = []
+        class Model:
+            def __init__(self, name, **kwargs):
+                calls.append((name, kwargs))
+            def transcribe(self, path, **kwargs):
+                calls.append((path, kwargs))
+                return [type("Segment", (), {"text": " Dolly Parton "})()], None
+        assert dj_audio.transcribe_recording(str(wav), model_factory=Model) == "Dolly Parton"
+        assert calls[0][0] == "medium"
+        assert calls[1][0] == str(wav)
+        bad = tmp_path / "bad.wav"
+        bad.write_bytes(b"not a wave")
+        with pytest.raises(ValueError):
+            dj_audio.transcribe_recording(str(bad), model_factory=Model)
+
+    def test_music_gate_only_asks_jev_if_request_is_music(self, monkeypatch):
+        import sys
+        import types
+        import plugins.voice_stack as voice_stack
+        from plugins.voice_stack import music
+
+        seen = {}
+        class Noul:
+            def __init__(self, *, instructions):
+                self.instructions = instructions
+        class Client:
+            def __init__(self, **kwargs):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                pass
+            def system_one(self, **kwargs):
+                seen.update(kwargs)
+                return types.SimpleNamespace(answers={"music": types.SimpleNamespace(noul=0.91)})
+        monkeypatch.setitem(sys.modules, "typesafe_sdk", types.SimpleNamespace(Noul=Noul, TypeSafeClient=Client))
+        monkeypatch.setattr(music, "_load_api_key", lambda: "test")
+        monkeypatch.setattr(voice_stack.events, "emit", lambda *_a, **_k: None)
+        assert voice_stack._jev_music_gate(object(), "Play Dolly Parton")[0] is True
+        assert list(seen["questions"]) == ["music"]
 
     def test_music_discussion_routes_to_music_profile(self, monkeypatch):
         """A music question that is NOT a playback request goes to DJ Yakkuza."""

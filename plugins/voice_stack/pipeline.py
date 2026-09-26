@@ -79,12 +79,13 @@ def _play_wake_beep_blocking() -> None:
                 logger.warning("Alexa wake cue requested without HERMES_ALEXA_MEDIA_PLAYER")
                 return
             cue_text = os.getenv("HERMES_WAKE_CUE_TEXT", "").strip()
-            play_text_alexa(
+            accepted = play_text_alexa(
                 cue_text or ".",
                 target,
                 notification_type="announce",
                 timeout=2,
             )
+            events.emit("wake_cue", target=target, accepted=accepted)
             return
 
         try:
@@ -632,6 +633,7 @@ class VoicePipeline:
         language: str = "en",
         min_confidence: float = 0.15,
         follow_up_min_confidence: float = 0.02,
+        route_low_confidence: bool = False,
         confidence_threshold: float = 0.70,
         wake_cooldown: float = 5.0,
         follow_up_delay: float = 0.35,
@@ -650,6 +652,7 @@ class VoicePipeline:
         self._language = language
         self._min_confidence = min_confidence
         self._follow_up_min_confidence = follow_up_min_confidence
+        self._route_low_confidence = route_low_confidence
         # Retained as an ignored constructor argument for compatibility with
         # older callers. The low floor above silently rejects hallucinations;
         # it never triggers the former fake confirmation branch.
@@ -816,7 +819,7 @@ class VoicePipeline:
                     continue
 
                 confidence_floor = self._confidence_floor(follow_up=follow_up)
-                if confidence < confidence_floor:
+                if confidence < confidence_floor and not self._route_low_confidence:
                     _finalize_recording(audio_path)
                     logger.debug(
                         "Discarding STT hallucination below confidence floor: %.3f %r",
