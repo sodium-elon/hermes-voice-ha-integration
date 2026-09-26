@@ -44,22 +44,30 @@ _YES = 0.5
 
 
 def _load_api_key():
-    """Return the TYPESAFE_API_KEY from the environment or hermes secrets."""
+    """Return the TYPESAFE_API_KEY, env first, then the single shared secret file.
+
+    Profile gateways run with HERMES_HOME pointing at ~/.hermes/profiles/<name>,
+    so a HERMES_HOME-relative secrets path would miss the shared file. Resolve in
+    precedence order: (1) TYPESAFE_API_KEY env var, (2) a profile-local
+    secrets/typesafe.env if present, (3) the root ~/.hermes/secrets/typesafe.env.
+    """
     key = os.getenv("TYPESAFE_API_KEY", "").strip()
     if key:
         return key
-    candidate = os.path.join(
-        os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes")),
-        "secrets",
-        "typesafe.env",
-    )
-    try:
-        for line in open(candidate, encoding="utf-8"):
-            line = line.strip()
-            if line.startswith("TYPESAFE_API_KEY="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
+    profile_home = os.getenv("HERMES_HOME", "").strip()
+    candidates = []
+    if profile_home:
+        candidates.append(os.path.join(profile_home, "secrets", "typesafe.env"))
+    candidates.append(os.path.join(os.path.expanduser("~/.hermes"), "secrets", "typesafe.env"))
+    for candidate in candidates:
+        try:
+            with open(candidate, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("TYPESAFE_API_KEY="):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            continue
     return ""
 
 
