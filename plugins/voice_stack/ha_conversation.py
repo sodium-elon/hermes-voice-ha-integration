@@ -137,10 +137,11 @@ async def _async_play_alexa_media(command: str, target: str) -> Dict[str, Any]:
 def play_alexa_media(command: str, target: str) -> Dict[str, Any]:
     """Run an Alexa custom media command from the background voice thread."""
     try:
-        return _run_async(_async_play_alexa_media(command, target))
+        result = _run_async(_async_play_alexa_media(command, target))
+        return {**result, "acceptance_kind": "ha_accepted_unverified" if result.get("ok") is True else "ha_failed"}
     except Exception as exc:
         logger.error("Alexa media playback failed: %s", exc)
-        return {"ok": False, "reason": "ha_error", "error": str(exc)}
+        return {"ok": False, "acceptance_kind": "ha_failed", "reason": "ha_error", "error": str(exc)}
 
 
 _NUMBER_WORDS = {

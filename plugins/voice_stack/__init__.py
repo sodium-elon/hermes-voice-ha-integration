@@ -1233,6 +1233,27 @@ ALEXA_SLOW_ACK = os.getenv("HERMES_ALEXA_SLOW_ACK", "On it — I'll have the ans
 ALEXA_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=2, thread_name_prefix="alexa-agent"
 )
+# Jev is observational: its network calls never occupy Alexa's agent workers.
+ASSIST_LABEL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="assist-label"
+)
+_ASSIST_LABEL_SLOTS = threading.BoundedSemaphore(2)
+
+def _schedule_assist_label(text: str) -> None:
+    """Best-effort bounded background label; never queues behind speech turns."""
+    if not _ASSIST_LABEL_SLOTS.acquire(blocking=False):
+        return
+    def run() -> None:
+        try:
+            _emit_assist_response_label(text, source="agent_reply")
+        finally:
+            _ASSIST_LABEL_SLOTS.release()
+    try:
+        ASSIST_LABEL_EXECUTOR.submit(run)
+    except RuntimeError:
+        _ASSIST_LABEL_SLOTS.release()
+        logger.debug("Assist reply label queue unavailable", exc_info=True)
+
 
 
 def _alexa_media_player() -> str:
@@ -1289,6 +1310,19 @@ def _deliver_slow_answer(text: str, target: Optional[str] = None) -> None:
         events.emit("spoken", sink=sink, attempt=1, slow=True, ok=ok)
     except Exception:
         logger.exception("Slow Alexa answer delivery failed")
+    # Label after delivery: inference must never delay, suppress, or rewrite speech.
+    _emit_assist_response_label(text, source="agent_reply")
+
+
+def _emit_assist_response_label(text: str, *, source: str) -> None:
+    """Record a semantic label; neither a service ACK nor a playback receipt."""
+    try:
+        from .assist_response_labels import label_spoken
+        result = label_spoken(text)
+        events.emit("assist_response_label", source=source,
+                    category=result["kind"], confidence=result["confidence"])
+    except Exception:
+        logger.warning("Assist reply labeling failed", exc_info=True)
 
 
 def _deliver_when_done(fut: "concurrent.futures.Future[str]", target: Optional[str] = None) -> None:
@@ -1365,6 +1399,9 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
         # Fast path: answer returns over the WebSocket (Alexa speaks it).
         # No done-callback is attached, so there is no duplicate spoken
         # delivery through notify.alexa_media.
+        # Observe semantics off the Assist response path: Alexa's reply must not
+        # wait for Jev, nor be rewritten by a classification failure.
+        _schedule_assist_label(response_text)
         return {
             "ok": True,
             "text": response_text,
@@ -1379,6 +1416,8 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
         # The ack itself is NOT re-spoken via notify: Alexa already speaks
         # the WS ack response natively on the asking device.
         cf.add_done_callback(lambda fut: _schedule_slow_delivery(fut, target_cf))
+        events.emit("assist_response_label", source="assist_ack",
+                    category="acknowledgment", confidence=1.0)
         return {
             "ok": True,
             "text": ALEXA_SLOW_ACK,
@@ -1409,9 +1448,11 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
         temperature=0.2,
         purpose="voice_stack.assist_query",
     )
+    response_text = (result.text or "").strip()
+    _schedule_assist_label(response_text)
     return {
         "ok": True,
-        "text": (result.text or "").strip(),
+        "text": response_text,
         "conversation_id": conversation_id,
         "provider": getattr(result, "provider", None),
         "model": getattr(result, "model", None),
