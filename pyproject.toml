@@ -9,10 +9,13 @@ requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9",
     "pydantic>=2.0",
+    "psycopg[binary]>=3.2",
+    "typesafe-sdk>=0.7,<1",
 ]
 
 [project.scripts]
 hermes-ha-install-plugins = "plugins.install_hermes_ha_plugins:main"
+hermes-music-memory = "plugins.voice_stack.music_preferences:main"
 
 [project.optional-dependencies]
 dev = [
