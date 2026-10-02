@@ -145,8 +145,13 @@ class HermesConversationAgent(ConversationEntity):
         if not response_speech:
             response_speech = "I processed your request but got no response."
 
+        # A reprompt keeps the Alexa session open for a follow-up (e.g. a pending
+        # yes/no confirmation). Empty/absent means the session ends as it does
+        # today for a plain reply.
+        reprompt = str(result.get("reprompt") or "").strip()
+
         response = intent.IntentResponse(language=language)
-        response.async_set_speech(response_speech)
+        response.async_set_speech(response_speech, extra_data={"reprompt": reprompt})
 
         return ConversationResult(
             response=response,

@@ -1221,6 +1221,9 @@ ALEXA_AGENT_SYSTEM_PROMPT = (
     "Use web or Home Assistant tools when they are needed to answer."
 )
 
+from . import alexa_confirmation
+_ALEXA_PENDING = alexa_confirmation.PendingConfirmation()
+
 ALEXA_SESSION_ID = "alexa_hermes"
 ALEXA_SESSION_TITLE = "Voice (Alexa)"
 # Alexa cuts the session at ~8s; Lambda read timeout is 10s. An agent turn
@@ -1339,23 +1342,32 @@ def _deliver_when_done(fut: "concurrent.futures.Future[str]", target: Optional[s
 def _deliver_when_done_with_target(
     answer_future: "concurrent.futures.Future[str]",
     target_future: "concurrent.futures.Future[str]",
+    generation: Optional[int] = None,
 ) -> None:
     """Resolve the asking Echo and deliver without blocking the event loop."""
     try:
         target = target_future.result(timeout=3.5)
     except Exception:
         target = ""
-    _deliver_when_done(answer_future, target=target)
+    if generation is not None:
+        try:
+            reply = (answer_future.result() or '').strip()
+        except Exception:
+            reply = alexa_confirmation.RECOVERY
+        _ALEXA_PENDING.deliver(generation, reply, target, _deliver_slow_answer)
+    else:
+        _deliver_when_done(answer_future, target=target)
 
 
 def _schedule_slow_delivery(
     answer_future: "concurrent.futures.Future[str]",
     target_future: "concurrent.futures.Future[str]",
+    generation: Optional[int] = None,
 ) -> None:
     """Move blocking target resolution and REST delivery off callback threads."""
     threading.Thread(
         target=_deliver_when_done_with_target,
-        args=(answer_future, target_future),
+        args=(answer_future, target_future, generation),
         name="alexa-slow-delivery",
         daemon=True,
     ).start()
@@ -1381,7 +1393,22 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
     language = str(payload.get("language") or "en")
     conversation_id = payload.get("conversation_id")
 
-    profile = _route_assist_profile(text)
+    if text == alexa_confirmation.LAUNCH and conversation_id == ALEXA_SESSION_ID:
+        return dict(ok=True, conversation_id=conversation_id, **_ALEXA_PENDING.launch())
+
+    arm_confirm = True
+    if conversation_id == ALEXA_SESSION_ID and text in (alexa_confirmation.YES, alexa_confirmation.NO):
+        work = _ALEXA_PENDING.answer("yes" if text == alexa_confirmation.YES else "no")
+        if work is None:
+            return dict(ok=True, conversation_id=conversation_id,
+                        text=alexa_confirmation.NO_PENDING)
+        # Forward the answer to the saved DJ session; never reclassify bare yes/no.
+        profile = work["profile"]
+        text = work["text"]
+        arm_confirm = False
+    else:
+        _ALEXA_PENDING.cancel()
+        profile = _route_assist_profile(text)
 
     target_cf = ALEXA_EXECUTOR.submit(_resolve_last_called_media_player)
     cf = ALEXA_EXECUTOR.submit(
@@ -1391,6 +1418,7 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
         session=ALEXA_SESSION_ID,
         session_title=ALEXA_SESSION_TITLE,
     )
+    generation = _ALEXA_PENDING.begin(text, profile, ALEXA_SESSION_ID) if arm_confirm else None
     try:
         response_text = await asyncio.wait_for(
             asyncio.shield(asyncio.wrap_future(cf)),
@@ -1415,7 +1443,10 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
         # keeps going and the done-callback speaks the answer on the Echo.
         # The ack itself is NOT re-spoken via notify: Alexa already speaks
         # the WS ack response natively on the asking device.
-        cf.add_done_callback(lambda fut: _schedule_slow_delivery(fut, target_cf))
+        if generation is not None:
+            cf.add_done_callback(lambda fut, g=generation: _schedule_slow_delivery(fut, target_cf, g))
+        else:
+            cf.add_done_callback(lambda fut: _schedule_slow_delivery(fut, target_cf))
         events.emit("assist_response_label", source="assist_ack",
                     category="acknowledgment", confidence=1.0)
         return {
