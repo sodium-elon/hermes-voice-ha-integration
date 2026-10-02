@@ -1048,6 +1048,16 @@ class TestWakeWordEngine:
         assert "jarvis" in words
 
 
+@pytest.fixture
+def authorized_pipeline_lifecycle(monkeypatch, tmp_path):
+    """Authorize synthetic turns only in tests of unrelated pipeline invariants."""
+    from plugins.voice_stack import pipeline
+
+    monkeypatch.setattr(pipeline, "authorize_request", lambda *args, **kwargs: True)
+    monkeypatch.setattr(pipeline.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.delenv("HERMES_VOICE_RETAIN_WAV", raising=False)
+
+
 class TestPipelineState:
     """VoicePipelineState unit tests."""
 
@@ -1128,7 +1138,7 @@ class TestPipelineState:
         assert abs(int(pcm[0])) <= 32767
         assert int(pcm[-1]) <= 32767
 
-    def test_low_confidence_transcript_is_processed_without_confirmation(self, monkeypatch):
+    def test_low_confidence_transcript_is_processed_without_confirmation(self, monkeypatch, authorized_pipeline_lifecycle):
         from plugins.voice_stack import pipeline as pipeline_module
         from plugins.voice_stack.pipeline import VoicePipeline
 
@@ -1166,7 +1176,7 @@ class TestPipelineState:
         assert callbacks == ["Turn on the kitchen light"]
         assert spoken == ["Done."]
 
-    def test_pipeline_keeps_audio_through_callback_and_exposes_bounded_redecode(self, monkeypatch):
+    def test_pipeline_keeps_audio_through_callback_and_exposes_bounded_redecode(self, monkeypatch, authorized_pipeline_lifecycle):
         """Routing can re-listen to the same WAV before cleanup, without owning STT."""
         import os
         from plugins.voice_stack import pipeline as pipeline_module
@@ -1221,7 +1231,7 @@ class TestPipelineState:
         assert calls[1][3] == "This is a complete spoken music request."
         assert os.path.exists(observed["audio_path"]) is False
 
-    def test_pipeline_does_not_retry_callback_when_callback_body_raises_typeerror(self, monkeypatch):
+    def test_pipeline_does_not_retry_callback_when_callback_body_raises_typeerror(self, monkeypatch, authorized_pipeline_lifecycle):
         """A callback bug is not evidence that the callback has an old signature."""
         from plugins.voice_stack import pipeline as pipeline_module
         from plugins.voice_stack.pipeline import VoicePipeline
@@ -1256,7 +1266,7 @@ class TestPipelineState:
 
         assert len(callback_calls) == 1
 
-    def test_opted_in_voice_callback_sees_low_confidence_wav_before_cleanup(self, monkeypatch):
+    def test_opted_in_voice_callback_sees_low_confidence_wav_before_cleanup(self, monkeypatch, authorized_pipeline_lifecycle):
         from plugins.voice_stack import pipeline as pipeline_module
         from plugins.voice_stack.pipeline import VoicePipeline
         import os
@@ -1318,7 +1328,7 @@ class TestPipelineState:
         assert spoken == []
         assert voice_pipeline.state.total_interactions == 0
 
-    def test_silent_handled_response_completes_turn_without_tts(self, monkeypatch):
+    def test_silent_handled_response_completes_turn_without_tts(self, monkeypatch, authorized_pipeline_lifecycle):
         from plugins.voice_stack import pipeline as pipeline_module
         from plugins.voice_stack.pipeline import VoicePipeline
 
@@ -1364,7 +1374,7 @@ class TestPipelineState:
         assert voice_pipeline._follow_up_turns == 0
         assert voice_pipeline._last_turn_end > 0
 
-    def test_question_response_relistens_without_second_wake_word(self, monkeypatch):
+    def test_question_response_relistens_without_second_wake_word(self, monkeypatch, authorized_pipeline_lifecycle):
         from plugins.voice_stack import pipeline as pipeline_module
         from plugins.voice_stack.pipeline import VoicePipeline
 
@@ -1799,6 +1809,7 @@ class TestPipelineState:
         from plugins.voice_stack import pipeline
 
         calls = []
+        monkeypatch.setenv("HERMES_WAKE_CUE_OUTPUT", "local")
         monkeypatch.setenv("HERMES_WAKE_BEEP_DURATION", "0.60")
         monkeypatch.setattr(
             pipeline.subprocess,
@@ -3974,7 +3985,7 @@ class TestPipelineSttFailureCleanup:
 
 
 class TestVoiceFollowUpTimeout:
-    def test_follow_up_uses_bounded_timeout_not_full_record(self, monkeypatch):
+    def test_follow_up_uses_bounded_timeout_not_full_record(self, monkeypatch, authorized_pipeline_lifecycle):
         """Wake-word listening never times out; only an UNANSWERED follow-up
         is bounded — during follow-up, capture waits at most the timeout."""
         from plugins.voice_stack import pipeline as pipeline_module
@@ -4011,6 +4022,8 @@ class TestVoiceFollowUpTimeout:
 
         monkeypatch.setattr(pipeline_module, "record_audio", fake_record)
         monkeypatch.setattr(pipeline_module, "_play_wake_beep", lambda: None)
+        monkeypatch.setattr(pipeline_module.time, "monotonic", lambda: 100.0)
+        monkeypatch.setattr(pipeline_module.time, "sleep", lambda _seconds: None)
 
         voice_pipeline = VoicePipeline(
             callback=lambda *_a, **_k: "Done.",
@@ -4023,6 +4036,9 @@ class TestVoiceFollowUpTimeout:
         voice_pipeline.state.enabled = True
         voice_pipeline._follow_up_pending = True  # armed, expecting quick answer
         voice_pipeline._follow_up_turns = 1
+        voice_pipeline._follow_up_deadline = 160.0
+        voice_pipeline._follow_up_context = ("Play TV4", "Should I play TV4?")
+        monkeypatch.setattr(voice_pipeline, "_speak", lambda _text: True)
 
         voice_pipeline._run_loop()
 

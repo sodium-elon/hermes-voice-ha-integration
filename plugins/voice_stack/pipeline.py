@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from . import events
+from .request_gate import authorize_request
+from .authorization_budget import authorize_with_budget
 
 logger = logging.getLogger(__name__)
 
@@ -667,6 +669,9 @@ class VoicePipeline:
         self._max_follow_up_turns = max(0, int(max_follow_up_turns))
         self._follow_up_pending = False
         self._follow_up_turns = 0
+        # Absolute monotonic lifetime; only a newly detected wake may refresh it.
+        self._follow_up_deadline = 0.0
+        self._follow_up_context = None
         self._alexa_reply_ready_at = 0.0
 
         self._thread: Optional[threading.Thread] = None
@@ -745,7 +750,13 @@ class VoicePipeline:
                 follow_up = self._follow_up_pending
                 self._follow_up_pending = False
                 if follow_up:
+                    if time.monotonic() >= self._follow_up_deadline:
+                        self._follow_up_turns = 0
+                        continue
                     self._wait_before_follow_up()
+                    if time.monotonic() >= self._follow_up_deadline:
+                        self._follow_up_turns = 0
+                        continue
                     events.emit("follow_up", phase="listening", turn=self._follow_up_turns)
                     _play_wake_beep()
                 else:
@@ -756,10 +767,16 @@ class VoicePipeline:
                         detected = self._wake_word.listen(timeout_seconds=5.0)
                         if not detected:
                             continue
+                        self._follow_up_deadline = time.monotonic() + 60.0
+                        self._follow_up_turns = 0
+                        self._follow_up_context = None
                         self._state.wake_word_detected = True
                         _play_wake_beep()
 
                 # 2. Record audio
+                if follow_up and time.monotonic() >= self._follow_up_deadline:
+                    self._follow_up_turns = 0
+                    continue
                 cache_dir = Path.home() / ".hermes" / "voice_cache"
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=str(cache_dir)) as tmp:
@@ -772,6 +789,15 @@ class VoicePipeline:
                         self._follow_up_timeout if follow_up and self._follow_up_timeout
                         else self._max_record_duration
                     )
+                    if follow_up:
+                        record_duration = min(
+                            record_duration, self._max_record_duration,
+                            self._follow_up_deadline - time.monotonic(),
+                        )
+                        if record_duration <= 0:
+                            _finalize_recording(audio_path)
+                            self._follow_up_turns = 0
+                            continue
                     recorded = record_audio(
                         audio_path,
                         duration=record_duration,
@@ -792,6 +818,10 @@ class VoicePipeline:
                     continue
 
                 # 3. STT
+                if follow_up and time.monotonic() >= self._follow_up_deadline:
+                    _finalize_recording(audio_path)
+                    self._follow_up_turns = 0
+                    continue
                 stt_started = time.monotonic()
                 try:
                     stt_result = self._stt.transcribe_with_confidence(
@@ -858,6 +888,25 @@ class VoicePipeline:
                     )
 
                 try:
+                    if follow_up and time.monotonic() >= self._follow_up_deadline:
+                        self._follow_up_turns = 0
+                        continue
+                    if not authorize_with_budget(
+                        authorize_request, transcript,
+                        wake_deadline=(self._follow_up_deadline if follow_up else None),
+                        previous_request=(self._follow_up_context[0]
+                                          if follow_up and self._follow_up_context else None),
+                        previous_question=(self._follow_up_context[1]
+                                           if follow_up and self._follow_up_context else None),
+                    ):
+                        self._follow_up_turns = 0
+                        self._state.wake_word_detected = False
+                        events.emit("discarded", reason="not_addressed_request")
+                        continue
+                    # The semantic judgment itself may outlast the wake window.
+                    if follow_up and time.monotonic() >= self._follow_up_deadline:
+                        self._follow_up_turns = 0
+                        continue
                     response = _invoke_callback(
                         self._callback,
                         transcript,
@@ -909,9 +958,11 @@ class VoicePipeline:
                 self._state.total_interactions += 1
                 self._state.wake_word_detected = False
                 requests_follow_up = _response_requests_follow_up(response)
-                if requests_follow_up and self._follow_up_turns < self._max_follow_up_turns:
+                if (requests_follow_up and time.monotonic() < self._follow_up_deadline
+                        and self._follow_up_turns < self._max_follow_up_turns):
                     self._follow_up_turns += 1
                     self._follow_up_pending = True
+                    self._follow_up_context = (transcript, response)
                     events.emit("follow_up", phase="armed", turn=self._follow_up_turns)
                 else:
                     self._follow_up_turns = 0
@@ -922,6 +973,8 @@ class VoicePipeline:
                 self._state.total_errors += 1
                 time.sleep(1.0)  # Back off on error
             finally:
+                if not self._follow_up_pending:
+                    self._follow_up_context = None
                 self._state.listening = False
 
     def _speak(self, text: str) -> bool:
