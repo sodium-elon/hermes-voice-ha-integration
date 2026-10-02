@@ -15,6 +15,32 @@ Local voice pipeline for Hermes Agent.
 └─────────┘    └─────┘    └───────────┘    └─────┘    └──────────────┘
 ```
 
+## Recorded-turn authorization and follow-ups
+
+A detected wake permits recording, not arbitrary task execution. After STT,
+`request_gate.authorize_request` makes a bounded Jev intent judgment before the
+routing callback. Ordinary conversation, uncertain judgments, invalid responses,
+and service outages terminate silently without routing, speaking, or arming a
+follow-up. This probabilistic gate reduces false-wake impact; it does not prove
+who spoke or eliminate wake-detector false positives.
+
+Follow-ups retain the current authorized request/question context and are allowed
+only within an absolute **60-second window starting at the detected wake**.
+Replies and follow-up speech never extend this deadline. A newly detected wake
+starts a fresh window. Expiry is checked around capture, transcription, and
+intent judgment; a task already accepted may finish, but its late reply cannot
+reopen listening. Wake-word detection remains available when the pipeline returns
+to idle. This does not add concurrent wake detection during an in-flight turn.
+
+A five-second wall-clock budget bounds the intent judgment, capped by the
+remaining follow-up lifetime. At most one intent-only worker may be in flight;
+a timed-out worker's late result cannot authorize a later turn. While a worker
+remains stuck, further judgments fail closed instead of spawning more threads.
+
+`HERMES_FOLLOW_UP_TIMEOUT` separately limits an individual follow-up recording;
+it is not the conversation deadline. Capture is capped by the remaining window.
+Physical wake/answer behavior must still be verified on the actual microphone.
+
 ## Engines (P1)
 
 | Stage | Default | Alternatives |
