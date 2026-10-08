@@ -10,6 +10,10 @@ from plugins import voice_stack as voice
 from plugins.voice_stack import alexa_confirmation
 
 COACH_REPLY = "Found the run. Confirm October third is the date you want imported."
+LIVE_IDENTITY_REPLY = (
+    'John, did you mean log your October eighth run with the Saucony Kinvara 16? '
+    'The voice transcript says “kindergarten,” and we’re logging shoes, not enrolling recruits.'
+)
 
 
 @pytest.fixture
@@ -54,10 +58,22 @@ def test_new_run_request_uses_fresh_agent_history(dialogue):
     assert calls[0][1]['session_title'] != calls[1][1]['session_title']
 
 
-def test_shoe_identity_question_keeps_current_request_context(dialogue, monkeypatch):
+@pytest.mark.parametrize('question', [
+    'Did you mean which shoe? The transcript was unclear.',
+    'Did you mean the Saucony Kinvara 16? Which run should I log?',
+    'Which run should I log? Did you mean the Saucony Kinvara 16? The transcript was unclear.',
+])
+def test_identity_question_does_not_arm_open_or_multiple_questions(question):
+    assert not alexa_confirmation.eligible_confirmation('sportscoach', question)
+
+
+@pytest.mark.parametrize('question', [
+    'For October eighth, did you mean the Saucony Kinvara 16?',
+    LIVE_IDENTITY_REPLY,
+])
+def test_shoe_identity_question_keeps_current_request_context(dialogue, monkeypatch, question):
     _, calls = dialogue
     request = 'here is for running coach: 2026-10-08 kinabaro 16'
-    question = 'For October eighth, did you mean the Saucony Kinvara 16?'
     def agent(text, **kwargs):
         calls.append((text, kwargs))
         return question if len(calls) == 1 else 'Answer handled.'
@@ -73,7 +89,8 @@ def test_shoe_identity_question_keeps_current_request_context(dialogue, monkeypa
     assert len(calls) == 2
 
 
-def test_slow_confirmation_reuses_origin_echo(dialogue, monkeypatch):
+@pytest.mark.parametrize('question', ['Did you mean the Saucony Kinvara 16?', LIVE_IDENTITY_REPLY])
+def test_slow_confirmation_reuses_origin_echo(dialogue, monkeypatch, question):
     _, calls = dialogue
     finish, launched = threading.Event(), threading.Event()
     targets = []
@@ -84,7 +101,7 @@ def test_slow_confirmation_reuses_origin_echo(dialogue, monkeypatch):
         calls.append((text, kwargs))
         if len(calls) == 1:
             assert finish.wait(2)
-            return 'Did you mean the Saucony Kinvara 16?'
+            return question
         return 'Answer handled.'
     monkeypatch.setattr(voice, '_resolve_last_called_media_player', lookup)
     monkeypatch.setattr(voice, '_run_full_agent', agent)

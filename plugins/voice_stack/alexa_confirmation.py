@@ -55,8 +55,10 @@ _COACH_CONFIRM_RE = re.compile(
 )
 
 
+# A binary identity question may be followed by declarative explanation, but
+# another question after it needs more than a one-shot yes/no answer.
 _IDENTITY_CONFIRM_RE = re.compile(
-    r"\b(?:did|do) you mean\s+(?!(?:which|what|when|where|how|who)\b)[^.!?\n]+\?\s*$",
+    r"\b(?:did|do) you mean\s+(?!(?:which|what|when|where|how|who)\b)[^.!?\n]+\?[^?]*$",
     re.IGNORECASE,
 )
 
@@ -72,6 +74,8 @@ def eligible_confirmation(profile: str, reply: str) -> bool:
         return False
     text = (reply or "").strip()
     if not text or len(text) > 600:
+        return False
+    if text.count("?") > 1 and re.search(r"\b(?:did|do) you mean\b", text, re.IGNORECASE):
         return False
     return bool(_CONFIRM_RE.search(text) or _IDENTITY_CONFIRM_RE.search(text) or (
         profile == "sportscoach" and _COACH_CONFIRM_RE.search(text)
