@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import threading
+import uuid
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -250,6 +251,10 @@ def _run_full_agent(
             ok=False,
             seconds=round(time.monotonic() - started, 2),
         )
+        if profile == "sportscoach":
+            # Return a deliverable failure even if this future finishes after
+            # Alexa's acknowledgment; an exception would lose the slow reply.
+            return "Sports Coach is unavailable right now."
         raise
 
     events.emit(
@@ -263,6 +268,8 @@ def _run_full_agent(
 
     response = (response or "").strip()
     if not response:
+        if profile == "sportscoach":
+            return "Sports Coach returned no completion. The run import is not confirmed."
         raise RuntimeError("Hermes voice agent returned no response")
     return response
 
@@ -304,6 +311,12 @@ def _voice_profile_for(text: str) -> Optional[str]:
     """Route personal running-data questions to the profile that owns them."""
     import re
 
+    # An explicit destination is transport routing, not a semantic judgment.
+    # Keep the original message untouched for the owner profile.
+    if re.match(r"^\s*here\s+is\s+for\s+running\s+coach\s*:", text, re.IGNORECASE):
+        return "sportscoach"
+    if text.strip().lower().startswith('here is for dj yakkuza:'):
+        return 'music'
     if re.search(
         r"\b(?:alpha\s*runner|alpha\s+run|garmin|run(?:ning)?\s+(?:stats?|data|history|record|progress)|fastest\s+run|personal\s+best|\bpb\b)\b",
         text,
@@ -1231,16 +1244,26 @@ ALEXA_SESSION_TITLE = "Voice (Alexa)"
 # notify.alexa_media, and the real answer is spoken when it's ready.
 ALEXA_AGENT_BUDGET_SECONDS = float(os.getenv("HERMES_ALEXA_AGENT_BUDGET", "6.5"))
 ALEXA_SLOW_ACK = os.getenv("HERMES_ALEXA_SLOW_ACK", "On it — I'll have the answer on your speaker in a moment.")
+ALEXA_BUSY = os.getenv("HERMES_ALEXA_BUSY", "I'm still working on your last request. Try again in a moment.")
 # Dedicated executor so slow Alexa runs never exhaust the loop's default
 # executor (shared with other plugin work).
 ALEXA_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=2, thread_name_prefix="alexa-agent"
 )
+_ALEXA_TURN_LOCK = threading.Lock()
 # Jev is observational: its network calls never occupy Alexa's agent workers.
 ASSIST_LABEL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="assist-label"
 )
 _ASSIST_LABEL_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _release_alexa_turn() -> None:
+    """Release the single active Alexa Assist turn if this process owns it."""
+    try:
+        _ALEXA_TURN_LOCK.release()
+    except RuntimeError:
+        logger.debug("Alexa turn lock release skipped; lock was not held", exc_info=True)
 
 def _schedule_assist_label(text: str) -> None:
     """Best-effort bounded background label; never queues behind speech turns."""
@@ -1396,98 +1419,161 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
     if text == alexa_confirmation.LAUNCH and conversation_id == ALEXA_SESSION_ID:
         return dict(ok=True, conversation_id=conversation_id, **_ALEXA_PENDING.launch())
 
-    arm_confirm = True
-    if conversation_id == ALEXA_SESSION_ID and text in (alexa_confirmation.YES, alexa_confirmation.NO):
-        work = _ALEXA_PENDING.answer("yes" if text == alexa_confirmation.YES else "no")
-        if work is None:
-            return dict(ok=True, conversation_id=conversation_id,
-                        text=alexa_confirmation.NO_PENDING)
-        # Forward the answer to the saved DJ session; never reclassify bare yes/no.
-        profile = work["profile"]
-        text = work["text"]
-        arm_confirm = False
-    else:
-        _ALEXA_PENDING.cancel()
-        profile = _route_assist_profile(text)
+    if not _ALEXA_TURN_LOCK.acquire(blocking=False):
+        events.emit("assist_response_label", source="assist_busy",
+                    category="acknowledgment", confidence=1.0)
+        return {
+            "ok": True,
+            "text": ALEXA_BUSY,
+            "conversation_id": conversation_id,
+            "runner": "busy",
+            "busy": True,
+        }
 
-    target_cf = ALEXA_EXECUTOR.submit(_resolve_last_called_media_player)
-    cf = ALEXA_EXECUTOR.submit(
-        _run_full_agent,
-        text,
-        profile=profile,
-        session=ALEXA_SESSION_ID,
-        session_title=ALEXA_SESSION_TITLE,
-    )
-    generation = _ALEXA_PENDING.begin(text, profile, ALEXA_SESSION_ID) if arm_confirm else None
+    release_deferred = False
+    arm_confirm = True
+    work = None
     try:
-        response_text = await asyncio.wait_for(
-            asyncio.shield(asyncio.wrap_future(cf)),
-            timeout=ALEXA_AGENT_BUDGET_SECONDS,
+        answer = {alexa_confirmation.YES: "yes", alexa_confirmation.NO: "no",
+                  "yes": "yes", "no": "no"}.get(text.lower())
+        if answer is not None:
+            # Native Yes/No intents and a plain answer forwarded by HermesIntent
+            # belong to the current pending question, not a new routed task.
+            work = _ALEXA_PENDING.answer(answer)
+            if work is None:
+                return dict(ok=True, conversation_id=conversation_id,
+                            text=alexa_confirmation.NO_PENDING)
+            # Forward the answer to the saved DJ session; never reclassify bare yes/no.
+            profile = work["profile"]
+            text = work["text"]
+            arm_confirm = False
+        else:
+            _ALEXA_PENDING.cancel()
+            profile = _route_assist_profile(text)
+
+        # A new specialist request is a new task, not an invitation to replay
+        # the old aliased voice history. Only the bounded answer reuses it.
+        if arm_confirm and profile in ("sportscoach", "music"):
+            agent_session = f"{ALEXA_SESSION_ID}-{uuid.uuid4().hex}"
+            agent_title = f"{ALEXA_SESSION_TITLE} {agent_session.rsplit('-', 1)[-1]}"
+        elif work is not None:
+            agent_session = work["session"]
+            agent_title = work.get("session_title") or ALEXA_SESSION_TITLE
+        else:
+            agent_session, agent_title = ALEXA_SESSION_ID, ALEXA_SESSION_TITLE
+
+        if work is not None and work.get("target_future") is not None:
+            target_cf = work["target_future"]
+        elif work is not None and work.get("target"):
+            target_cf = concurrent.futures.Future()
+            target_cf.set_result(work["target"])
+        else:
+            target_cf = ALEXA_EXECUTOR.submit(_resolve_last_called_media_player)
+        cf = ALEXA_EXECUTOR.submit(
+            _run_full_agent,
+            text,
+            profile=profile,
+            session=agent_session,
+            session_title=agent_title,
         )
-        # Fast path: answer returns over the WebSocket (Alexa speaks it).
-        # No done-callback is attached, so there is no duplicate spoken
-        # delivery through notify.alexa_media.
-        # Observe semantics off the Assist response path: Alexa's reply must not
-        # wait for Jev, nor be rewritten by a classification failure.
+        generation = (_ALEXA_PENDING.begin(text, profile, agent_session, session_title=agent_title, target_future=target_cf)
+                      if arm_confirm else None)
+        try:
+            response_text = await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(cf)),
+                timeout=ALEXA_AGENT_BUDGET_SECONDS,
+            )
+            # Fast path: answer returns over the WebSocket (Alexa speaks it).
+            # No done-callback is attached, so there is no duplicate spoken
+            # delivery through notify.alexa_media.
+            # Observe semantics off the Assist response path: Alexa's reply must not
+            # wait for Jev, nor be rewritten by a classification failure.
+            _schedule_assist_label(response_text)
+            native_reply = (_ALEXA_PENDING.native_response(generation, response_text)
+                            if generation is not None else {"text": response_text})
+            return {
+                "ok": True,
+                **native_reply,
+                "conversation_id": conversation_id,
+                "runner": "sessions api",
+                "profile": profile,
+            }
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            # Timeout or handler cancellation cannot stop the raw worker. Keep
+            # turn ownership and its completion policy until that future ends;
+            # the existing done-callback delivers once and releases ownership.
+            # The ack itself is NOT re-spoken via notify: Alexa already speaks
+            # the WS ack response natively on the asking device.
+            release_deferred = True
+            if generation is not None:
+                def _deliver_generated_and_release(fut, g=generation):
+                    try:
+                        _schedule_slow_delivery(fut, target_cf, g)
+                    finally:
+                        _release_alexa_turn()
+                cf.add_done_callback(_deliver_generated_and_release)
+            else:
+                def _deliver_plain_and_release(fut):
+                    try:
+                        _schedule_slow_delivery(fut, target_cf)
+                    finally:
+                        _release_alexa_turn()
+                cf.add_done_callback(_deliver_plain_and_release)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            events.emit("assist_response_label", source="assist_ack",
+                        category="acknowledgment", confidence=1.0)
+            return {
+                "ok": True,
+                "text": ALEXA_SLOW_ACK,
+                "conversation_id": conversation_id,
+                "runner": "sessions api+slow_delivery",
+                "profile": profile,
+                "slow": True,
+            }
+        except Exception as exc:
+            if profile == "sportscoach":
+                logger.warning("Alexa specialist agent %s failed: %s", profile, exc)
+                return {
+                    "ok": True,
+                    "text": "Sports Coach is unavailable right now.",
+                    "conversation_id": conversation_id,
+                    "runner": "specialist unavailable",
+                    "profile": profile,
+                }
+            logger.warning("Alexa tool-capable agent failed; falling back to raw LLM: %s", exc)
+
+        result = await ctx.llm.acomplete(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Hermes, responding through Home Assistant Assist. "
+                        "Reply naturally and concisely for text-to-speech. "
+                        "If the request needs unavailable context, ask one brief clarification."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Language: {language}\nUser request: {text}",
+                },
+            ],
+            max_tokens=512,
+            temperature=0.2,
+            purpose="voice_stack.assist_query",
+        )
+        response_text = (result.text or "").strip()
         _schedule_assist_label(response_text)
         return {
             "ok": True,
             "text": response_text,
             "conversation_id": conversation_id,
-            "runner": "sessions api",
-            "profile": profile,
+            "provider": getattr(result, "provider", None),
+            "model": getattr(result, "model", None),
         }
-    except asyncio.TimeoutError:
-        # Slow path: attach delivery to the still-running raw future — the
-        # asyncio wrapper was cancelled by wait_for, but the worker thread
-        # keeps going and the done-callback speaks the answer on the Echo.
-        # The ack itself is NOT re-spoken via notify: Alexa already speaks
-        # the WS ack response natively on the asking device.
-        if generation is not None:
-            cf.add_done_callback(lambda fut, g=generation: _schedule_slow_delivery(fut, target_cf, g))
-        else:
-            cf.add_done_callback(lambda fut: _schedule_slow_delivery(fut, target_cf))
-        events.emit("assist_response_label", source="assist_ack",
-                    category="acknowledgment", confidence=1.0)
-        return {
-            "ok": True,
-            "text": ALEXA_SLOW_ACK,
-            "conversation_id": conversation_id,
-            "runner": "sessions api+slow_delivery",
-            "profile": profile,
-            "slow": True,
-        }
-    except Exception as exc:
-        logger.warning("Alexa tool-capable agent failed; falling back to raw LLM: %s", exc)
-
-    result = await ctx.llm.acomplete(
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are Hermes, responding through Home Assistant Assist. "
-                    "Reply naturally and concisely for text-to-speech. "
-                    "If the request needs unavailable context, ask one brief clarification."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Language: {language}\nUser request: {text}",
-            },
-        ],
-        max_tokens=512,
-        temperature=0.2,
-        purpose="voice_stack.assist_query",
-    )
-    response_text = (result.text or "").strip()
-    _schedule_assist_label(response_text)
-    return {
-        "ok": True,
-        "text": response_text,
-        "conversation_id": conversation_id,
-        "provider": getattr(result, "provider", None),
-        "model": getattr(result, "model", None),
-    }
+    finally:
+        if not release_deferred:
+            _release_alexa_turn()
 
 
 # ---------------------------------------------------------------------------

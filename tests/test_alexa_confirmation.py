@@ -70,6 +70,35 @@ def test_eligible_confirmation_rejects_non_music_or_non_yes_no(profile: str, rep
     assert not alexa_confirmation.eligible_confirmation(profile, reply)
 
 
+COACH_REPLY = (
+    "Found your October third run: 5.64 kilometers in 31 minutes 19 seconds, "
+    "at 5:33 per kilometer; kjordan matches your Qiaodan Leili 2.0 shoes. "
+    "It isn’t logged yet—since it’s near midnight locally, "
+    "confirm October third is the date you want imported."
+)
+
+
+def test_coach_delayed_confirmation_reopens_existing_skill(monkeypatch) -> None:
+    pending = alexa_confirmation.PendingConfirmation(clock=Clock())
+    generation = pending.begin("get today's run using kjordan", "sportscoach", "alexa_hermes")
+    launches, notifications = [], []
+    monkeypatch.setattr(alexa_confirmation, "launch_skill", lambda target: launches.append(target) or True)
+
+    pending.deliver(generation, COACH_REPLY, "media_player.echo", lambda text, target=None: notifications.append(text))
+
+    assert launches == ["media_player.echo"]
+    assert notifications == []
+    assert pending.launch() == {"text": COACH_REPLY, "reprompt": alexa_confirmation.ANSWER_REPROMPT}
+    work = pending.answer("yes")
+    assert work is not None
+    assert work["profile"] == "sportscoach"
+    assert work["session"] == "alexa_hermes"
+    assert "Original request: get today's run using kjordan" in work["text"]
+    assert COACH_REPLY in work["text"]
+    assert "User answer: yes" in work["text"]
+    assert pending.answer("yes") is None
+
+
 def test_launch_without_pending_returns_ready_prompt_and_reprompt() -> None:
     pending = alexa_confirmation.PendingConfirmation(clock=Clock())
 
@@ -208,16 +237,19 @@ def test_voice_stack_wires_launch_yes_no_and_generation_delivery() -> None:
     assert "from . import alexa_confirmation" in source
     assert "_ALEXA_PENDING = alexa_confirmation.PendingConfirmation()" in source
     assert "if text == alexa_confirmation.LAUNCH" in source
-    assert "text in (alexa_confirmation.YES, alexa_confirmation.NO)" in source
+    assert 'alexa_confirmation.YES: "yes"' in source
+    assert 'alexa_confirmation.NO: "no"' in source
     assert "_ALEXA_PENDING.answer(" in source
-    assert "_ALEXA_PENDING.begin(text, profile, ALEXA_SESSION_ID)" in source
+    assert "_ALEXA_PENDING.begin(text, profile, agent_session, session_title=agent_title, target_future=target_cf)" in source
     assert "_ALEXA_PENDING.deliver(generation, reply, target, _deliver_slow_answer)" in source
 
 
 def test_slow_ack_path_passes_generation_to_done_callback() -> None:
     source = _source("plugins/voice_stack/__init__.py")
-    assert "cf.add_done_callback(lambda fut, g=generation: _schedule_slow_delivery(fut, target_cf, g))" in source
-    assert "cf.add_done_callback(lambda fut: _schedule_slow_delivery(fut, target_cf))" in source
+    calls = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name) and node.func.id == '_schedule_slow_delivery']
+    assert any(len(node.args) == 3 for node in calls)
+    assert any(len(node.args) == 2 for node in calls)
 
 
 def test_conversation_component_passes_reprompt_extra_data() -> None:
@@ -236,3 +268,108 @@ def test_docs_include_deploy_and_rollback_warning() -> None:
     assert "reprompt" in doc
     assert "rollback" in doc.lower()
     assert "Physical Echo test" in doc
+
+
+
+@pytest.mark.parametrize("reply", [
+    COACH_REPLY,
+    "Confirm that October third is the date you want imported.",
+    "Should I import this run with Qiaodan shoes?",
+    "Would you like me to log the run?",
+])
+def test_coach_yes_no_eligibility(reply):
+    assert alexa_confirmation.eligible_confirmation("sportscoach", reply)
+
+
+@pytest.mark.parametrize("profile,reply", [
+    ("sportscoach", "Which shoe did you wear?"),
+    ("sportscoach", "Confirm which date is correct."),
+    ("sportscoach", "Confirm that which date is correct."),
+    ("sportscoach", "Please confirm the date."),
+    ("sportscoach", "October third is the date you want imported."),
+    ("sportscoach", "Confirmed the run is imported."),
+    ("sportscoach", "Confirm October third is correct. Which shoe?"),
+    ("sportscoach", "x" * 601 + " Should I import it?"),
+    ("default", COACH_REPLY),
+    ("coder", "Should I delete the repository?"),
+    ("music", "Confirm October third is the date you want imported."),
+])
+def test_coach_confirmation_rejects_ambiguous_or_unrelated_replies(profile, reply):
+    assert not alexa_confirmation.eligible_confirmation(profile, reply)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("answer", ["yes", "no"])
+def test_coach_answer_expires_at_exact_deadline(monkeypatch, native, answer):
+    clock = Clock()
+    pending = alexa_confirmation.PendingConfirmation(clock=clock)
+    generation = pending.begin("import run", "sportscoach", "alexa_hermes")
+    monkeypatch.setattr(alexa_confirmation, "launch_skill", lambda target: True)
+    if native:
+        pending.native_response(generation, COACH_REPLY)
+    else:
+        pending.deliver(generation, COACH_REPLY, "media_player.echo", lambda *a, **kw: None)
+    clock.advance(30)
+    assert pending.answer(answer) is None
+    assert pending.launch()["text"] == alexa_confirmation.READY
+
+
+def test_native_response_stale_generation_preserves_new_question():
+    pending = alexa_confirmation.PendingConfirmation(clock=Clock())
+    old = pending.begin("old", "sportscoach", "alexa_hermes")
+    new = pending.begin("new", "sportscoach", "alexa_hermes")
+    assert pending.native_response(new, COACH_REPLY)["reprompt"]
+    assert not pending.native_response(old, COACH_REPLY)["reprompt"]
+    work = pending.answer("no")
+    assert work is not None
+    assert "Original request: new" in work["text"]
+
+
+def test_native_response_non_confirmation_clears_pending():
+    pending = alexa_confirmation.PendingConfirmation(clock=Clock())
+    generation = pending.begin("run", "sportscoach", "alexa_hermes")
+    assert not pending.native_response(generation, "Run imported.")["reprompt"]
+    assert pending.pending is None
+
+
+def test_coach_new_request_cancels_previous_confirmation():
+    pending = alexa_confirmation.PendingConfirmation(clock=Clock())
+    generation = pending.begin("old run", "sportscoach", "alexa_hermes")
+    pending.native_response(generation, COACH_REPLY)
+    pending.begin("new request", "sportscoach", "alexa_hermes")
+    assert pending.answer("yes") is None
+
+
+def test_native_response_expired_work_does_not_rearm():
+    clock = Clock()
+    pending = alexa_confirmation.PendingConfirmation(clock=clock)
+    generation = pending.begin("run", "sportscoach", "alexa_hermes")
+    clock.advance(180)
+    assert not pending.native_response(generation, COACH_REPLY)["reprompt"]
+    assert pending.answer("yes") is None
+
+
+
+@pytest.mark.parametrize("target", ["", "media_player.echo"])
+def test_coach_failed_relaunch_clears_confirmation(monkeypatch, target):
+    pending = alexa_confirmation.PendingConfirmation(clock=Clock())
+    generation = pending.begin("run", "sportscoach", "alexa_hermes")
+    notifications = []
+    monkeypatch.setattr(alexa_confirmation, "launch_skill", lambda target: False)
+    pending.deliver(generation, COACH_REPLY, target, lambda text, target=None: notifications.append(text))
+    assert notifications == [alexa_confirmation.RECOVERY]
+    assert pending.answer("yes") is None
+
+
+def test_documented_query_and_launch_handlers_propagate_native_reprompt():
+    import yaml
+    doc = _source("docs/alexa-delayed-confirmation.md")
+    config = yaml.safe_load(doc.split("```yaml\n", 1)[1].split("```", 1)[0])["intent_script"]
+    for name in ("HermesIntent", alexa_confirmation.SKILL_ID):
+        assert "extra_data.reprompt" in config[name]["reprompt"]["text"]
+        data = config[name]["action"][0]["data"]
+        assert data["agent_id"] == "conversation.hermes"
+        assert data["conversation_id"] == "alexa_hermes"
+    for name, marker in (("AMAZON.YesIntent", alexa_confirmation.YES), ("AMAZON.NoIntent", alexa_confirmation.NO)):
+        assert config[name]["action"][0]["data"]["text"] == marker
+        assert "reprompt" not in config[name]  # consumed answer ends native dialogue

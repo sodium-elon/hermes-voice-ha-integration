@@ -1,12 +1,12 @@
 """One household-scoped confirmation via the existing Alexa/HA conversation route.
 
-Design (user-mandated, minimal): a delayed DJ answer that ends in a yes/no
-question is NOT spoken as a one-way notification. Instead its reply is held in
-one bounded pending record, the *same* "Hermes Assistant" skill is relaunched
-on the asking Echo, the existing HA Launch intent returns that pending reply
-with a reprompt (so Alexa keeps listening), and a single spoken yes/no is
-consumed and forwarded to the same DJ session. The Jarvis wake pipeline and its
-60s deadline are untouched.
+Design: a delayed DJ or Sportscoach yes/no confirmation is NOT spoken as a
+one-way notification. Instead its reply is held in one bounded pending record,
+the *same* "Hermes Assistant" skill is relaunched on the asking Echo, and the
+existing HA Launch intent returns the pending reply with a reprompt. Fast replies
+return a native reprompt directly. A single spoken yes/no is consumed and
+forwarded to the saved specialist context; its result cannot arm another question.
+The Jarvis wake pipeline and its 60s deadline are untouched.
 
 Trust model: this route carries no Amazon device/user/session identity, so it
 cannot prove which Echo or person supplied an answer. ``last_called`` targets
@@ -16,6 +16,7 @@ existing authenticated HA transport; full-envelope identity is out of scope.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import re
 import threading
 import time
@@ -45,19 +46,36 @@ _CONFIRM_RE = re.compile(
 )
 
 
-def eligible_confirmation(profile: str, reply: str) -> bool:
-    """Only a DJ/music reply that ends in a yes/no question.
+# Coach can ask for yes/no approval as an imperative, without a question mark.
+# Require a terminal proposition ("confirm X is Y"), not an open-ended prompt.
+_COACH_CONFIRM_RE = re.compile(
+    r"\bconfirm\s+(?!(?:that\s+)?(?:which|what|when|where|how|who)\b)"
+    r"(?:that\s+)?[^.!?\n]*\b(?:is|are)\b[^.!?\n]*[.?]\s*$",
+    re.IGNORECASE,
+)
 
-    Deliberately conservative: a bare question mark or an open-ended question
-    does not qualify. This is a heuristic (matching the DJ's actual phrasings),
-    not semantic validation; unsupported cases stay on the notification path.
+
+_IDENTITY_CONFIRM_RE = re.compile(
+    r"\b(?:did|do) you mean\s+(?!(?:which|what|when|where|how|who)\b)[^.!?\n]+\?\s*$",
+    re.IGNORECASE,
+)
+
+
+def eligible_confirmation(profile: str, reply: str) -> bool:
+    """Recognize bounded yes/no requests from DJ or Sportscoach.
+
+    A bare question mark or open-ended question does not qualify. This is a
+    conservative heuristic, not semantic validation; unsupported cases stay
+    on the notification path. Coach also uses terminal "confirm X is Y."
     """
-    if profile != "music":
+    if profile not in ("music", "sportscoach"):
         return False
     text = (reply or "").strip()
     if not text or len(text) > 600:
         return False
-    return bool(_CONFIRM_RE.search(text))
+    return bool(_CONFIRM_RE.search(text) or _IDENTITY_CONFIRM_RE.search(text) or (
+        profile == "sportscoach" and _COACH_CONFIRM_RE.search(text)
+    ))
 
 
 def launch_skill(target: str) -> bool:
@@ -71,18 +89,28 @@ def launch_skill(target: str) -> bool:
     if not target:
         return False
     try:
-        from ..home_assistant.ha_assistant import call_service
-        result = call_service(
-            "media_player",
-            "play_media",
-            entity_id=target,
-            data={
+        import json
+        import urllib.request
+        from .ha_conversation import _get_config
+
+        url, token = _get_config()
+        if not token:
+            return False
+        request = urllib.request.Request(
+            f"{url.rstrip('/')}/api/services/media_player/play_media",
+            data=json.dumps({
+                "entity_id": target,
                 "media_content_type": "skill",
                 "media_content_id": SKILL_ID,
-            },
+            }).encode("utf-8"),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
         )
-        return "error" not in result
-    except Exception:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            response.read()
+        return True  # HA acceptance only; native Echo capture needs physical verification.
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Alexa skill relaunch failed: %s", type(exc).__name__)
         return False
 
 
@@ -94,6 +122,9 @@ class Pending:
     session: str
     deadline: float
     reply: str = ""
+    session_title: str | None = None
+    target: str = ""
+    target_future: object | None = None
 
 
 class PendingConfirmation:
@@ -105,12 +136,13 @@ class PendingConfirmation:
         self.generation = 0
         self.pending = None
 
-    def begin(self, request, profile, session):
+    def begin(self, request, profile, session, *, session_title=None, target_future=None):
         """Start a record for an in-flight slow turn (before it completes)."""
         with self.lock:
             self.generation += 1
             self.pending = Pending(
-                self.generation, request, profile, session, self.clock() + 180
+                self.generation, request, profile, session, self.clock() + 180,
+                session_title=session_title, target_future=target_future,
             )
             return self.generation
 
@@ -123,17 +155,43 @@ class PendingConfirmation:
             # New request or expiry: launch intent surfaces the normal ready prompt.
             return {"text": READY, "reprompt": READY}
 
+    def native_response(self, generation, reply):
+        """Arm one answer for a fast native reply, without notification/relaunch.
+
+        The 30-second budget starts here, not at measured speech completion.
+        Expired/stale work cannot arm or replace a newer pending question.
+        """
+        response = {"text": reply, "reprompt": ""}
+        with self.lock:
+            pending = self.pending
+            if not pending or pending.generation != generation:
+                return response
+            if self.clock() >= pending.deadline or not eligible_confirmation(pending.profile, reply):
+                self.pending = None
+                return response
+            pending.reply = reply
+            pending.deadline = self.clock() + 30
+            response["reprompt"] = ANSWER_REPROMPT
+            return response
+
     def deliver(self, generation, reply, target, notify):
         """Route a finished slow answer: arm confirmation or notify declaratively."""
         with self.lock:
             pending = self.pending
             if not pending or pending.generation != generation:
                 return
-            if self.clock() >= pending.deadline:
+            # Sportscoach's declarative completion is a result notification,
+            # not permission to reopen a microphone or authorize another write.
+            # It must survive a slow import; questions retain their deadline.
+            if self.clock() >= pending.deadline and (
+                pending.profile != "sportscoach" or eligible_confirmation(pending.profile, reply)
+                or bool(_CONFIRM_RE.search(reply or ""))
+            ):
                 self.pending = None
                 return
             if eligible_confirmation(pending.profile, reply):
                 pending.reply = reply
+                pending.target = target
                 pending.deadline = self.clock() + 30
                 if target and launch_skill(target):
                     return  # armed; the Launch intent now speaks the question.
@@ -155,9 +213,12 @@ class PendingConfirmation:
             work = {
                 "profile": pending.profile,
                 "session": pending.session,
+                "session_title": pending.session_title,
+                "target": pending.target,
+                "target_future": pending.target_future,
                 "text": (
                     f"Original request: {pending.request}\n"
-                    f"DJ reply/question: {pending.reply}\n"
+                    f"{'Coach' if pending.profile == 'sportscoach' else 'DJ'} reply/question: {pending.reply}\n"
                     f"User answer: {answer}\n"
                     "Handle this answer only; do not ask another question."
                 ),
