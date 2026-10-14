@@ -18,11 +18,23 @@ Local voice pipeline for Hermes Agent.
 ## Recorded-turn authorization and follow-ups
 
 A detected wake permits recording, not arbitrary task execution. After STT,
-`request_gate.authorize_request` makes a bounded Jev intent judgment before the
-routing callback. Ordinary conversation, uncertain judgments, invalid responses,
-and service outages terminate silently without routing, speaking, or arming a
-follow-up. This probabilistic gate reduces false-wake impact; it does not prove
-who spoke or eliminate wake-detector false positives.
+`request_gate.authorize_request` makes one bounded Jev Choice before the routing
+callback. Choices distinguish general information for Ria Sunn, music for DJ
+Yakkuza, personal running/coaching for Sportscoach, device and other requests,
+contextual answers, background speech and unclear input. Clear standalone
+questions need not repeat the assistant's name after the wake. A permitted
+`general_information` decision travels with that same turn directly to the
+default agent, bypassing HA device NLU and the recorded music judgment. Existing
+music WAV and Sportscoach transports are unchanged; the admission labels do not
+replace those specialist handoffs. The selected option must meet the existing
+0.9 probability floor. Contextual answers additionally require both current
+request/question fields; deadline enforcement remains in the pipeline.
+Ordinary conversation, uncertain judgments, invalid responses, and service
+outages terminate silently without routing, speaking, or arming a follow-up.
+`request_judgment` events record the actual label/probability or a distinct
+credential/service/invalid-response failure. This probabilistic gate reduces
+false-wake impact; it does not prove who spoke or eliminate wake-detector false
+positives.
 
 Follow-ups retain the current authorized request/question context and are allowed
 only within an absolute **60-second window starting at the detected wake**.
