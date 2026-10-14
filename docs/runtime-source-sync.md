@@ -40,3 +40,14 @@ verification; the archived experiment is not a deployable release.
 Music preferences belong in sodium-elon/music-preferences. The old voice-repository
 feature checkout was superseded by that repository's merged PR 1; do not reintroduce
 the database, CLI and DJ feature into the voice integration.
+
+## Alexa question capture and binary confirmations
+
+HermesBridge uses Dialog.ElicitSlot for ordinary launches, empty questions and
+open follow-up prompts because HermesIntent.query is AMAZON.SearchQuery. Its
+configured dialog model is required; a plain reprompt only recognizes intent
+samples with carrier phrases. A pending confirmation is distinguished by the
+HA reprompt "Please answer yes or no." and retains native YesIntent/NoIntent
+recognition without query-slot elicitation. Validate both long open questions
+and specialist yes/no context when changing either mode. Log only request type,
+intent and whether the query exists; never log raw envelopes or access tokens.
