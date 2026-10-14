@@ -162,7 +162,11 @@ def test_pipeline_preserves_mock_seam_and_supplies_followup_deadline(monkeypatch
     p._follow_up_context = ("Weather?", "Which city?")
     p._run_loop()
     assert calls == []
-    assert judgments == [(evaluator, "Paris", {
+    assert len(judgments) == 1
+    wrapped, text, context = judgments[0]
+    assert text == "Paris"
+    assert context == {
         "wake_deadline": 100.1, "previous_request": "Weather?",
         "previous_question": "Which city?",
-    })]
+    }
+    assert wrapped(text, previous_request="Weather?", previous_question="Which city?") is True

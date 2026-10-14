@@ -127,7 +127,7 @@ INCIDENT_TRANSCRIPTS = [
 def test_unaddressed_incident_speech_is_silent_before_any_routing(harness, monkeypatch, text):
     h = harness
     judgments = []
-    def deny(transcript, **context):
+    def deny(transcript, decision_out=None, **context):
         judgments.append((transcript, context))
         return False
     monkeypatch.setattr(mod, "authorize_request", deny, raising=False)
@@ -157,10 +157,11 @@ def fake_jev(monkeypatch):
             state.calls.append(kw)
             if state.error:
                 raise state.error
-            return SimpleNamespace(answers={"addressed_request": SimpleNamespace(noul=state.value)})
+            label = "contextual_answer" if kw["state"]["previous_question"] else "general_information"
+            return SimpleNamespace(answers={"addressed_request": SimpleNamespace(choice=label, probabilities={label: state.value})})
     monkeypatch.setattr(music, "_load_api_key", lambda: "test-key")
     monkeypatch.setitem(sys.modules, "typesafe_sdk", SimpleNamespace(
-        TypeSafeClient=Client, Noul=lambda **kw: kw, NoulCriteria=lambda **kw: kw,
+        TypeSafeClient=Client, Choice=lambda **kw: kw,
         RetryPolicy=lambda **kw: SimpleNamespace(**kw)))
     return state
 
@@ -187,7 +188,7 @@ def test_invalid_or_uncertain_intent_fails_closed(fake_jev, value):
 def test_contextual_answer_uses_only_current_authorized_question(harness, monkeypatch):
     h = harness
     judgments = []
-    def authorize(text, **context):
+    def authorize(text, decision_out=None, **context):
         judgments.append((text, context))
         return True
     monkeypatch.setattr(mod, "authorize_request", authorize)
@@ -208,8 +209,8 @@ def test_contextual_jev_judgment_has_explicit_answer_policy(fake_jev):
     call = fake_jev.calls[0]
     assert call["state"]["previous_question"] == "Which city?"
     criteria = call["questions"]["addressed_request"]["criteria"]
-    assert "contextual answer" in criteria["true"]
-    assert "unrelated conversation" in criteria["false"]
+    assert "previous_question" in criteria["contextual_answer"]
+    assert "conversation" in criteria["background_speech"]
 
 
 def test_fresh_wake_resets_expired_deadline_and_question_context(harness, fake_jev):
@@ -307,6 +308,17 @@ def test_valid_low_confidence_short_answer_dispatches_inside_window(harness, fak
     assert h.p._follow_up_deadline == 160.0
     assert not h.p._follow_up_pending
     assert all(not Path(path).exists() for path in h.paths)
+
+
+def test_general_choice_reaches_callback_from_same_authorized_turn(harness, fake_jev):
+    h = harness
+    def callback(text, **kwargs):
+        h.calls.append((text, kwargs))
+        h.p.state.enabled = False
+        return "Answer."
+    h.p._callback = callback
+    h.p._run_loop()
+    assert h.calls[0][1]["request_choice"] == "general_information"
 
 
 def test_semantic_gate_expiry_cannot_dispatch_followup(harness, monkeypatch):

@@ -69,6 +69,23 @@ def test_running_regex_fast_path_routes_to_sportscoach(voice, monkeypatch):
     assert _route(voice, "What is my fastest run in august") == "sportscoach"
 
 
+@pytest.mark.parametrize("text", [
+    "here is for running coach: 2026-10-04 kaldan leyley 2.0",
+    " Here is for Running Coach: 2026-10-05 Nike Vomero Plus ",
+])
+def test_explicit_running_coach_destination_bypasses_jev(voice, monkeypatch, text):
+    monkeypatch.setattr(voice, "_jev_route_specialist", lambda _t: pytest.fail("explicit destination must not need Jev"))
+    assert _route(voice, text) == "sportscoach"
+
+
+def test_quoted_destination_is_not_an_explicit_route(voice, monkeypatch):
+    seen = []
+    monkeypatch.setattr(voice, "_jev_route_specialist", lambda text: (seen.append(text), None)[1])
+    text = 'Explain the phrase "here is for running coach:"'
+    assert _route(voice, text) is None
+    assert seen == [text]
+
+
 def test_music_choice_routes_to_music(voice, fake_route_sdk):
     fake_route_sdk["choice"] = "music"
     fake_route_sdk["confidence"] = 0.85

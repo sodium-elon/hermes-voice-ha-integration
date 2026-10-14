@@ -130,7 +130,20 @@ async def _async_play_alexa_media(command: str, target: str) -> Dict[str, Any]:
             timeout=aiohttp.ClientTimeout(total=_MEDIA_SERVICE_TIMEOUT),
         ) as response:
             response.raise_for_status()
-            await response.read()
+            acknowledgement = await response.json()
+            # HA's ordinary service endpoint returns changed states. For Alexa's
+            # asynchronous custom command, [] is a valid acceptance ACK, not
+            # proof music started. Reject error objects/garbage rather than
+            # manufacturing a positive receipt from HTTP status alone.
+            if not isinstance(acknowledgement, list) or any(
+                not isinstance(state, dict) or state.get("error")
+                or not isinstance(state.get("entity_id"), str)
+                or re.fullmatch(r"[a-z_][a-z0-9_]*\.[a-z0-9_]+", state["entity_id"]) is None
+                or not isinstance(state.get("state"), str)
+                or not isinstance(state.get("attributes"), dict)
+                for state in acknowledgement
+            ):
+                raise RuntimeError("Invalid Home Assistant service acknowledgment")
     return {"ok": True, "target": target, "command": command}
 
 

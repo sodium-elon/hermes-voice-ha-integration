@@ -891,8 +891,12 @@ class VoicePipeline:
                     if follow_up and time.monotonic() >= self._follow_up_deadline:
                         self._follow_up_turns = 0
                         continue
+                    request_decision = {}
+                    def evaluate_request(text, _decision=request_decision, **context):
+                        return _invoke_callback(authorize_request, text,
+                                                decision_out=_decision, **context)
                     if not authorize_with_budget(
-                        authorize_request, transcript,
+                        evaluate_request, transcript,
                         wake_deadline=(self._follow_up_deadline if follow_up else None),
                         previous_request=(self._follow_up_context[0]
                                           if follow_up and self._follow_up_context else None),
@@ -913,6 +917,7 @@ class VoicePipeline:
                         confidence=confidence,
                         audio_path=audio_path,
                         redecode=redecode,
+                        request_choice=request_decision.get("choice"),
                     )
                 finally:
                     _finalize_recording(audio_path)
