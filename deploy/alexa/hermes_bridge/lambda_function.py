@@ -24,10 +24,23 @@ _TERMINAL_INTENTS = (
 )
 
 _ELICIT_PROMPT = 'What would you like to know?'
+_BINARY_REPROMPT = 'Please answer yes or no.'
+
+
+def _query_directive():
+    return {
+        'type': 'Dialog.ElicitSlot',
+        'slotToElicit': 'query',
+        'updatedIntent': {
+            'name': 'HermesIntent',
+            'confirmationStatus': 'NONE',
+            'slots': {'query': {'name': 'query', 'confirmationStatus': 'NONE'}},
+        },
+    }
 
 
 def _speak_and_listen(text):
-    """Speak a prompt and keep native intent recognition open."""
+    """Capture an open question using the configured SearchQuery dialog."""
     return {
         'version': '1.0',
         'sessionAttributes': {},
@@ -35,12 +48,13 @@ def _speak_and_listen(text):
             'outputSpeech': {'type': 'PlainText', 'text': text},
             'reprompt': {'outputSpeech': {'type': 'PlainText', 'text': text}},
             'shouldEndSession': False,
+            'directives': [_query_directive()],
         },
     }
 
 
 def _keep_listening(payload):
-    """Preserve HA's native reprompt; do not force query-slot dialog."""
+    """Capture open questions; preserve native yes/no for pending confirmations."""
     if not isinstance(payload, dict):
         return payload
 
@@ -53,6 +67,11 @@ def _keep_listening(payload):
         response['reprompt'] = {
             'outputSpeech': {'type': 'PlainText', 'text': _ELICIT_PROMPT},
         }
+    prompt = response['reprompt'].get('outputSpeech', {}).get('text', '')
+    if prompt != _BINARY_REPROMPT:
+        directives = response.setdefault('directives', [])
+        if not any(d.get('type', '').startswith('Dialog.') for d in directives):
+            directives.append(_query_directive())
     response['shouldEndSession'] = False
     return payload
 
@@ -79,8 +98,12 @@ def lambda_handler(event, context):
     request_type = request.get('type')
     intent = request.get('intent') or {}
     intent_name = intent.get('name')
+    _logger.info('Alexa request type=%s intent=%s query_present=%s',
+                 request_type, intent_name,
+                 bool((intent.get('slots') or {}).get('query', {}).get('value')))
 
-    # An empty query needs a prompt, with ordinary intent recognition enabled.
+    # An empty general query needs slot capture; pending binary questions use
+    # the HA reprompt and bypass this path.
     if request_type == 'IntentRequest' and intent_name == 'HermesIntent':
         slot = (intent.get('slots') or {}).get('query') or {}
         if not slot.get('value'):

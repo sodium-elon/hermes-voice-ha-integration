@@ -45,23 +45,49 @@ class BridgeTests(unittest.TestCase):
             self.assertTrue(result['response']['shouldEndSession'])
             self.assertNotIn('reprompt', result['response'])
 
-    def test_empty_query_prompts_without_network_or_slot_dialog(self):
+    def test_empty_query_captures_open_question_without_network(self):
         result, calls, _ = self.call({'type': 'IntentRequest', 'intent': {'name': 'HermesIntent', 'slots': {}}}, {})
         self.assertEqual(calls, [])
         self.assertFalse(result['response']['shouldEndSession'])
-        self.assertNotIn('directives', result['response'])
+        self.assertEqual(result['response']['directives'], [bridge._query_directive()])
         self.assertEqual(result['response']['reprompt']['outputSpeech']['text'], bridge._ELICIT_PROMPT)
 
-    def test_general_query_gets_standard_reprompt(self):
+    def test_general_reply_captures_next_open_question(self):
         result, _, _ = self.call({'type': 'IntentRequest', 'intent': {'name': 'HermesIntent', 'slots': {'query': {'value': 'hello'}}}}, {'response': {'outputSpeech': {'type': 'PlainText', 'text': 'Hello'}, 'shouldEndSession': True}})
         self.assertFalse(result['response']['shouldEndSession'])
         self.assertEqual(result['response']['reprompt']['outputSpeech']['text'], bridge._ELICIT_PROMPT)
-        self.assertNotIn('directives', result['response'])
+        self.assertEqual(result['response']['directives'], [bridge._query_directive()])
 
     def test_wrapped_payload_preserves_existing_directives(self):
         result = bridge._keep_listening({'body': {'response': {'directives': [{'type': 'Display.RenderTemplate'}], 'reprompt': {'outputSpeech': {'type': 'PlainText', 'text': 'Please answer yes or no.'}}}}})
         self.assertEqual(result['body']['response']['directives'], [{'type': 'Display.RenderTemplate'}])
         self.assertEqual(result['body']['response']['reprompt']['outputSpeech']['text'], 'Please answer yes or no.')
+
+    def test_ordinary_launch_captures_open_question(self):
+        result, _, _ = self.call({'type': 'LaunchRequest'}, {
+            'response': {'outputSpeech': {'type': 'PlainText', 'text': 'Ready'},
+                         'reprompt': {'outputSpeech': {'type': 'PlainText', 'text': 'Ready'}}}})
+        self.assertEqual(result['response']['directives'], [bridge._query_directive()])
+
+    def test_fast_binary_question_preserves_yes_no_recognition(self):
+        result, _, _ = self.call({'type': 'IntentRequest', 'intent': {
+            'name': 'HermesIntent', 'slots': {'query': {'value': 'play music'}}}}, {
+            'response': {'outputSpeech': {'type': 'PlainText', 'text': 'Would you like jazz?'},
+                         'reprompt': {'outputSpeech': {'type': 'PlainText', 'text': bridge._BINARY_REPROMPT}}}})
+        self.assertNotIn('directives', result['response'])
+        self.assertFalse(result['response']['shouldEndSession'])
+
+    def test_fallback_captures_repeated_question(self):
+        result, _, _ = self.call({'type': 'IntentRequest', 'intent': {'name': 'AMAZON.FallbackIntent'}},
+                                {'response': {'outputSpeech': {'type': 'PlainText', 'text': 'Please repeat.'}}})
+        self.assertEqual(result['response']['directives'], [bridge._query_directive()])
+
+    def test_open_capture_preserves_display_and_avoids_duplicate_dialog(self):
+        payload = {'response': {'directives': [{'type': 'Display.RenderTemplate'}]}}
+        result = bridge._keep_listening(payload)
+        bridge._keep_listening(result)
+        self.assertEqual(result['response']['directives'],
+                         [{'type': 'Display.RenderTemplate'}, bridge._query_directive()])
 
     def test_missing_token_does_not_send_request(self):
         with patch.dict(os.environ, {'BASE_URL': 'https://test.invalid'}), patch.object(bridge, '_debug', False):
