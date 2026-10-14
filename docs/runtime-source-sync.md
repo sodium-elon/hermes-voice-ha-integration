@@ -17,3 +17,26 @@ The source helper does not update AWS, restart services, merge PRs or manage Her
 Sportscoach's run/coaching skills remain owned by sodium-elon/alpharunner, using scripts/install-sportscoach-skills.py --install and --verify from its clean main. Hermes is responsible for reconciling installed guidance into that source and verifying the managed snapshots after a merge; memory changes are not a substitute.
 
 Existing voice deadlines, real user authorization and one-shot answer rules remain unchanged.
+
+## Completing and retiring feature work
+
+After a verified merge and main deployment, remove the completed feature checkout.
+For unfinished work, compare every changed and untracked file against current main,
+complete and merge useful independent changes, then explicitly confirm removal of
+obsolete checkouts after making a verified recoverable archive. Do not leave a
+superseded prototype described as pending production repair.
+
+The native-alexa-delayed-dialogue experiment is retired as a proposed replacement
+for the current confirmation fix: the existing HermesBridge reprompt route passed
+the physical Sportscoach yes/no test. The experiment needs a new full-envelope
+HA endpoint and exact Amazon-device mapping; its controller supports only music
+confirmation and its legacy Assist path predates current Sportscoach context and
+admission safeguards. It must not replace the working route. Reusable request-gate,
+recording, provenance, forwarding, dispatch tests and operational guidance have
+been incorporated separately into main. Full-envelope identity could be considered
+in a separately scoped future change with Sportscoach support and physical
+verification; the archived experiment is not a deployable release.
+
+Music preferences belong in sodium-elon/music-preferences. The old voice-repository
+feature checkout was superseded by that repository's merged PR 1; do not reintroduce
+the database, CLI and DJ feature into the voice integration.
