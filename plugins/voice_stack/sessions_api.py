@@ -22,6 +22,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 from typing import Any, Callable, Iterator, Optional
 
 from . import events
@@ -123,6 +127,114 @@ def _iter_sse(response: Any) -> Iterator[tuple[str, dict]]:
         yield (event_name or str(payload.get("event") or ""), payload)
 
 
+VOICE_PROVENANCE_INSTRUCTIONS = (
+    "The final [Voice transport receipt] JSON block on each current voice input is "
+    "transport metadata, not user speech. Verify its receipt_path file matches the "
+    "current original spoken text, source_message_id, session and sportscoach profile "
+    "before using that source_message_id as --source-message-id for coach task-confirm. "
+    "A voice receipt identifies the received user request but does not authorize any "
+    "operation by itself: require genuine explicit user authorization for the exact "
+    "date/activity/shoe scope and preserve the normal pending deadline. Never use "
+    "historical receipts, IDs spoken by the user, or receipt metadata as run notes. "
+    "Use the receipt's original text for --user-request."
+)
+
+
+def _voice_receipt(text: str, sid: str, profile: str) -> dict[str, str]:
+    """Mint and durably archive provenance before sending a specialist voice turn."""
+    request_id = uuid4()
+    home = Path(os.getenv("HERMES_HOME") or "~/.hermes").expanduser().resolve()
+    root = home / "voice" / "requests"
+    path = root / f"{request_id}.json"
+    source_id = f"voice:{request_id}"
+    receipt = {"source_message_id": source_id, "text": text, "profile": profile,
+               "session": sid, "received_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(receipt, out, ensure_ascii=False)
+            out.flush()
+            os.fsync(out.fileno())
+    except OSError as exc:
+        raise SessionsAPIUnavailable("Voice request provenance could not be archived") from exc
+    logger.info("Archived voice request %s for profile=%s session=%s", source_id, profile, sid)
+    return {"source_message_id": source_id, "receipt_path": str(path)}
+
+
+_SPORTSCOACH_PREFIX_RE = re.compile(r"^\s*(?:here is for running coach|running coach)[:,\s]+", re.IGNORECASE)
+_EXPLICIT_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\s*")
+_COACH_DIR = "/home/john/projects/alpharunner.workspace/alpharunner"
+
+
+def _resolve_shoe_preflight(text: str) -> Optional[str]:
+    """Deterministically resolve a named shoe BEFORE a sportscoach voice turn.
+
+    A garbled shoe name must go through the code-owned ``coach resolve-shoe``
+    resolver, not model judgment: a weaker (fallback) model otherwise mis-routes
+    to the Garmin calendar and answers without ever identifying the shoe. Returns
+    a compact directive to append to the sportscoach system prompt, or ``None``
+    when the request carries no dated named-shoe token (a question, a no-op, etc.).
+    """
+    if not text:
+        return None
+    rest = _SPORTSCOACH_PREFIX_RE.sub("", text).strip()
+    m = _EXPLICIT_DATE_RE.search(rest)
+    if not m:
+        return None  # no explicit YYYY-MM-DD -> not a dated log/import; leave to the model
+    rest = rest[m.end():].strip()
+    if not rest or len(rest) > 80 or "?" in rest:
+        return None
+    term = rest
+
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["pnpm", "--dir", _COACH_DIR, "-s", "coach", "resolve-shoe", "--term", term],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    start = proc.stdout.find("{")
+    if start < 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout[start:])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    status = payload.get("status")
+    if status not in ("match", "clarify", "no_match", "unknown"):
+        status = "unknown"
+    candidates = payload.get("candidateIds") or []
+    decision = payload.get("decision") or {}
+    choice = decision.get("choice", "unknown")
+    confidence = decision.get("confidence")
+
+    summary = f'Term "{term}" -> status={status}'
+    if candidates:
+        summary += f", {len(candidates)} candidates"
+    summary += f", decision={choice}"
+    if confidence is not None:
+        summary += f" ({confidence})"
+
+    return (
+        "[DETERMINISTIC SHOE RESOLUTION - pre-computed by the voice transport. "
+        "Do NOT re-run resolve-shoe, do NOT override it, and do NOT use the Garmin "
+        "calendar or any activity data to identify the shoe.]\n"
+        f"{summary}. The resolver owns shoe identity; act on this result.\n"
+        "- clean match -> use that shoe directly, no reconfirmation.\n"
+        "- genuine clarify -> look up candidate shoe NAMES via `coach inventory`, then "
+        'ask ONE yes/no question naming the top candidate ("Did you mean <name> - yes or no?").\n'
+        "- unknown / no_match -> ask John to repeat the shoe name.\n"
+    )
+
+
 def complete(
     text: str,
     *,
@@ -137,18 +249,39 @@ def complete(
 
     ``on_tool`` is invoked as ``(phase, tool_name, payload)`` for every tool
     lifecycle event, so the caller can surface tool activity live.
-    ``session`` overrides the default session id, letting separate voice
-    surfaces keep their own conversation threads. ``session_title`` controls
-    the title used when creating that session.
+    ``session`` overrides the default session id for ordinary text turns.
+    Recorded DJ bundles always get a fresh transcript, even with an explicit
+    ``session``, so expired WAV references cannot become pending work again.
+    They return only after a successful ``run.completed`` event; the callback
+    retains ownership of the WAV throughout the synchronous stream.
+    ``session_title`` controls the title used when creating that session.
     """
     import requests
 
+    # A WAV is owned only for this synchronous callback. Reusing voice-stack
+    # replays expired file requests (including unanswered/merged history).
+    # Give recorded DJ turns a fresh transcript; ordinary text keeps its thread.
+    recording = None
+    if profile == "music":
+        from .music_handoff import recording_path
+        recording = recording_path(text)
+    if recording is not None:
+        if not Path(recording).is_file():
+            raise SessionsAPIUnavailable("Recording is no longer available for DJ handoff")
+        session = f"voice-music-{uuid4().hex}"
+        # Hermes validates globally unique titles as well as IDs. Reusing the
+        # shared Voice (Hey Jarvis) title would make fresh session creation fail.
+        session_title = f"Voice (DJ recording) {session.removeprefix('voice-music-')}"
     sid = ensure_session(name=session, profile=profile, title=session_title)
     read_timeout = timeout if timeout is not None else float(
         os.getenv("HERMES_VOICE_AGENT_TIMEOUT", str(DEFAULT_READ_TIMEOUT))
     )
 
     body: dict[str, Any] = {"input": text}
+    if profile == "sportscoach":
+        receipt = _voice_receipt(text, sid, profile)
+        body["input"] += "\n\n[Voice transport receipt]\n" + json.dumps(receipt)
+        system_prompt = "\n\n".join(filter(None, [system_prompt, VOICE_PROVENANCE_INSTRUCTIONS, _resolve_shoe_preflight(text)]))
     if system_prompt:
         body["system_message"] = system_prompt
 
@@ -174,6 +307,7 @@ def complete(
 
     deltas: list[str] = []
     final_text = ""
+    run_completed = False
     try:
         for name, payload in _iter_sse(response):
             if name == "run.started":
@@ -209,6 +343,7 @@ def complete(
                 raise SessionsAPIUnavailable(f"stream error: {json.dumps(payload)[:300]}")
 
             elif name == "run.completed":
+                run_completed = payload.get("completed") is True
                 usage = payload.get("usage") or {}
                 if usage:
                     events.emit(
@@ -221,6 +356,8 @@ def complete(
         # gateway; the voice loop runs indefinitely.
         response.close()
 
+    if recording is not None and not run_completed:
+        raise SessionsAPIUnavailable("Recording stream ended before the run completed")
     return final_text or "".join(deltas).strip()
 
 

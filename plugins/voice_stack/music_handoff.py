@@ -195,6 +195,22 @@ def _state(records, hints) -> dict:
     }
 
 
+def recording_path(prompt: str) -> str | None:
+    """Recognize our recorded-turn bundle, not ordinary music chat text."""
+    try:
+        payload = json.loads(prompt)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("role") != "DJ Yakkuza":
+        return None
+    routing = payload.get("routing")
+    path = payload.get("audio_path")
+    if (isinstance(routing, dict) and routing.get("route") == "music"
+            and isinstance(path, str) and path.strip()):
+        return path
+    return None
+
+
 def build_prompt(audio_path, decision) -> str:
     """Produce the evidence bundle DJ consumes for a music route."""
     payload = {

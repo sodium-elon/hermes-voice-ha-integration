@@ -31,8 +31,9 @@ def sse(event: str, payload: dict) -> list[str]:
 
 
 @pytest.fixture
-def api_key(monkeypatch):
+def api_key(monkeypatch, tmp_path):
     monkeypatch.setenv("API_SERVER_KEY", "test-key")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     return "test-key"
 
 

@@ -11,7 +11,7 @@ def test_context_preserves_new_addressed_requests(monkeypatch):
 
     def judge(self, **kwargs):
         calls.append(kwargs)
-        return SimpleNamespace(answers={"addressed_request": SimpleNamespace(noul=.95)})
+        return SimpleNamespace(answers={"addressed_request": SimpleNamespace(choice="device_request", probabilities={"device_request": .95})})
 
     monkeypatch.setattr(sdk.TypeSafeClient, "system_one", judge)
     assert request_gate.authorize_request(
@@ -19,4 +19,5 @@ def test_context_preserves_new_addressed_requests(monkeypatch):
         previous_question="Which artist?",
     )
     question = calls[0]["questions"]["addressed_request"]
-    assert "new request" in question.criteria["true"]
+    assert "new request" in question.instructions
+    assert "device_request" in question.criteria

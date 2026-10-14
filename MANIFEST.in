@@ -6,3 +6,5 @@ recursive-include plugins *.py *.yaml *.md
 recursive-include skills *
 recursive-include tests *.py
 global-exclude __pycache__ *.py[cod] .DS_Store
+recursive-include scripts *.py
+recursive-include deploy *.py *.md
