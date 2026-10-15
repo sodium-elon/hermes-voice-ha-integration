@@ -6,6 +6,8 @@ the *same* "Hermes Assistant" skill is relaunched on the asking Echo, and the
 existing HA Launch intent returns the pending reply with a reprompt. Fast replies
 return a native reprompt directly. A single spoken yes/no is consumed and
 forwarded to the saved specialist context; its result cannot arm another question.
+Delayed general answers also return once through native Launch, with ordinary
+query capture after speech. They are distinct from binary approval state.
 The Jarvis wake pipeline and its 60s deadline are untouched.
 
 Trust model: this route carries no Amazon device/user/session identity, so it
@@ -132,10 +134,11 @@ class Pending:
     session_title: str | None = None
     target: str = ""
     target_future: object | None = None
+    open_reply: bool = False
 
 
 class PendingConfirmation:
-    """One globally pending yes/no follow-up, generation-tagged and deadline-bounded."""
+    """One pending native reply or binary follow-up, generation/deadline bounded."""
 
     def __init__(self, clock=time.monotonic):
         self.clock = clock
@@ -158,7 +161,14 @@ class PendingConfirmation:
         with self.lock:
             pending = self.pending
             if pending and pending.reply and self.clock() < pending.deadline:
+                if pending.open_reply:
+                    # General delayed answers must be spoken natively before
+                    # Alexa opens its ordinary follow-up capture window.
+                    self.pending = None
+                    return {"text": pending.reply, "reprompt": READY}
                 return {"text": pending.reply, "reprompt": ANSWER_REPROMPT}
+            if pending and pending.open_reply:
+                self.pending = None
             # New request or expiry: launch intent surfaces the normal ready prompt.
             return {"text": READY, "reprompt": READY}
 
@@ -182,37 +192,59 @@ class PendingConfirmation:
             return response
 
     def deliver(self, generation, reply, target, notify):
-        """Route a finished slow answer: arm confirmation or notify declaratively."""
+        """Route a finished slow answer through its original voice surface."""
         with self.lock:
             pending = self.pending
             if not pending or pending.generation != generation:
                 return
-            # Sportscoach's declarative completion is a result notification,
-            # not permission to reopen a microphone or authorize another write.
-            # It must survive a slow import; questions retain their deadline.
+            if pending.open_reply:
+                return  # duplicate completion cannot launch or speak twice
+            # Sportscoach completion notifications outlive slow imports;
+            # questions and general replies retain their existing deadline.
             if self.clock() >= pending.deadline and (
                 pending.profile != "sportscoach" or eligible_confirmation(pending.profile, reply)
                 or bool(_CONFIRM_RE.search(reply or ""))
             ):
                 self.pending = None
                 return
-            if eligible_confirmation(pending.profile, reply):
+            if pending.profile in (None, "default") and target:
+                pending.reply = reply
+                pending.target = target
+                pending.open_reply = True
+                # Publish under lock, but never hold it across general re-entry
+                # I/O. Launch/new request/close must be able to consume or
+                # supersede this exact generation while that request runs.
+            elif eligible_confirmation(pending.profile, reply):
                 pending.reply = reply
                 pending.target = target
                 pending.deadline = self.clock() + 30
                 if target and launch_skill(target):
-                    return  # armed; the Launch intent now speaks the question.
+                    return
                 self.pending = None
                 notify(RECOVERY, target=target)
                 return
+            else:
+                self.pending = None
+                notify(reply, target=target)
+                return
+
+        try:
+            reopened = launch_skill(target)
+        except Exception:
+            reopened = False
+        if reopened:
+            return  # HA acceptance; actual Launch/mic requires separate evidence.
+        with self.lock:
+            if self.pending is not pending:
+                return  # already consumed/superseded; do not duplicate or erase newer work
             self.pending = None
-            notify(reply, target=target)
+        notify(reply, target=target)
 
     def answer(self, answer):
         """Consume the pending record and package a one-shot yes/no follow-up."""
         with self.lock:
             pending = self.pending
-            if not pending or not pending.reply:
+            if not pending or not pending.reply or pending.open_reply:
                 return None
             if self.clock() >= pending.deadline or answer not in ("yes", "no"):
                 self.pending = None
