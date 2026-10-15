@@ -50,7 +50,9 @@ samples with carrier phrases. A pending confirmation is distinguished by the
 HA reprompt "Please answer yes or no." and retains native YesIntent/NoIntent
 recognition without query-slot elicitation. Validate both long open questions
 and specialist yes/no context when changing either mode. Log only request type,
-intent and whether the query exists; never log raw envelopes or access tokens.
+intent and whether the query exists, plus Alexa's session-ending reason and bounded
+validation error detail; never log raw envelopes or access tokens. SessionEndedRequest
+is handled locally with an empty response; it has no speech or HA action.
 
 Explicit conversation-ending judgment, its source-owned phrase corpus and relay-first
 deployment order are described in [conversation-ending.md](conversation-ending.md).

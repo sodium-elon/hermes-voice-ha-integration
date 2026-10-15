@@ -103,7 +103,18 @@ def _consume_end_signal(payload):
 def lambda_handler(event, context):
     """Handle incoming Alexa directive."""
 
-    _logger.debug('Event: %s', event)
+    # Raw Alexa envelopes contain account-linking credentials. Never log them.
+    request = event.get('request') or {}
+    if request.get('type') == 'SessionEndedRequest':
+        error = request.get('error') or {}
+        # Alexa's validation message is diagnostic data, not user speech.
+        # Bound it and strip control characters to keep a single safe log line.
+        detail = str(error.get('message', ''))
+        detail = ''.join(c if c.isprintable() else ' ' for c in detail)[:512]
+        _logger.warning('Alexa session ended reason=%s error_type=%s detail=%s',
+                        request.get('reason'), error.get('type'), detail)
+        # This notification has no spoken response and needs no HA forwarding.
+        return {}
 
     base_url = os.environ.get('BASE_URL')
     assert base_url is not None, 'Please set BASE_URL environment variable'
