@@ -68,3 +68,26 @@ zero false closes and zero missed expected closes in this run. Judged-call media
 was 0.2175 seconds and maximum 0.414 seconds, below the 0.75-second awaited budget.
 This is one measured example set, not a guarantee for arbitrary future speech.
 The prompt examples and held-out cases are reported separately above.
+
+## Delayed general answers and the listening window
+
+A general answer that outlives Alexa's initial request budget is returned through
+the same native skill on the original asking Echo. Cache the completed answer,
+re-enter the skill, speak it from Launch, then use the ordinary query reprompt.
+Consume that cached answer once; it is never a binary confirmation and cannot
+authorize a task. This lets Alexa begin listening after the real answer rather
+than timing out while a separate notification is being spoken.
+
+The existing 180-second stale-result cap remains. Superseded or expired general
+answers cannot reopen the microphone. If the requesting Echo is unknown or native
+re-entry fails, deliver the original answer by the existing notification fallback
+without claiming a fresh microphone window. Specialist confirmation and
+declarative task-completion policies remain unchanged.
+
+Re-entry network I/O runs outside the general-result state lock. Cleanup on an
+immediate failure checks that the same pending object is still current, so a
+concurrent Launch or newer request cannot cause duplicate speech or erase newer
+state. HA accepting the launch service is not proof that a native Launch arrived.
+If acceptance is followed by no Launch, the answer stays cached until its existing
+expiry; a manual skill opening can retrieve it. There is no asynchronous retry
+watchdog that could race with a late Launch and speak twice.
