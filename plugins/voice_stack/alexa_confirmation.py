@@ -88,13 +88,21 @@ def eligible_confirmation(profile: str, reply: str) -> bool:
 
 
 def launch_skill(target: str) -> bool:
-    """Relaunch the existing skill on the asking Echo via Alexa Media Player.
+    """Use the verified skill shortcut for native binary confirmations."""
+    return _launch_media(target, "skill", SKILL_ID)
 
-    ``media_content_type: skill`` is documented and confirmed in the installed
-    Alexa Media Player (5.16.0) source. Best-effort; False on any failure so the
-    caller can fall back to a declarative message instead of an unanswered
-    notification question.
+
+def launch_open_question(target: str) -> bool:
+    """Open normally: the skill shortcut rejects Dialog.ElicitSlot on reentry.
+
+    A fixed utterance selects the existing Hermes Assistant invocation, not
+    model-generated text. Alexa Media Player 5.16 supports the custom command.
     """
+    return _launch_media(target, "custom", "open Hermes Assistant")
+
+
+def _launch_media(target: str, media_type: str, content: str) -> bool:
+    """HA acceptance only; Launch and actual microphone capture need evidence."""
     if not target:
         return False
     try:
@@ -109,8 +117,8 @@ def launch_skill(target: str) -> bool:
             f"{url.rstrip('/')}/api/services/media_player/play_media",
             data=json.dumps({
                 "entity_id": target,
-                "media_content_type": "skill",
-                "media_content_id": SKILL_ID,
+                "media_content_type": media_type,
+                "media_content_id": content,
             }).encode("utf-8"),
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             method="POST",
@@ -229,7 +237,7 @@ class PendingConfirmation:
                 return
 
         try:
-            reopened = launch_skill(target)
+            reopened = launch_open_question(target)
         except Exception:
             reopened = False
         if reopened:
