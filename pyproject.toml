@@ -53,4 +53,4 @@ exclude = ["addon*", "custom_components*", "skills*", "tests*"]
 
 [tool.setuptools.package-data]
 "plugins.home_assistant" = ["plugin.yaml", "README.md"]
-"plugins.voice_stack" = ["plugin.yaml", "README.md"]
+"plugins.voice_stack" = ["plugin.yaml", "README.md", "conversation_end_examples.json"]

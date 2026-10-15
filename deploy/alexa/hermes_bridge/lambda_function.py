@@ -25,6 +25,7 @@ _TERMINAL_INTENTS = (
 
 _ELICIT_PROMPT = 'What would you like to know?'
 _BINARY_REPROMPT = 'Please answer yes or no.'
+_END_SIGNAL = '__hermes_conversation_end_v1__'
 
 
 def _query_directive():
@@ -74,6 +75,29 @@ def _keep_listening(payload):
             directives.append(_query_directive())
     response['shouldEndSession'] = False
     return payload
+
+
+def _consume_end_signal(payload):
+    """An exact gateway speech signal closes natively; never inspect user words."""
+    if not isinstance(payload, dict):
+        return False
+    body = payload.get('body') if isinstance(payload.get('body'), dict) else payload
+    response = body.get('response')
+    if not isinstance(response, dict):
+        return False
+    speech = response.get('outputSpeech') or {}
+    if speech.get('type') != 'PlainText' or speech.get('text') != _END_SIGNAL:
+        return False
+    response['outputSpeech'] = {'type': 'PlainText', 'text': 'Goodbye.'}
+    response['shouldEndSession'] = True
+    response.pop('reprompt', None)
+    directives = [d for d in response.get('directives', [])
+                  if not d.get('type', '').startswith('Dialog.')]
+    if directives:
+        response['directives'] = directives
+    else:
+        response.pop('directives', None)
+    return True
 
 
 def lambda_handler(event, context):
@@ -138,6 +162,9 @@ def lambda_handler(event, context):
         }
 
     payload = json.loads(response.data.decode('utf-8'))
+
+    if _consume_end_signal(payload):
+        return payload
 
     keep_open = (
         request_type == 'LaunchRequest'

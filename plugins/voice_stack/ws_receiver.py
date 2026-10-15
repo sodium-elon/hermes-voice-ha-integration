@@ -256,6 +256,12 @@ async def handle_assist_query(payload: dict[str, Any]) -> dict[str, Any]:
         response_text = str(result.get("text") or "").strip()
         if not response_text:
             response_text = "I processed that, but did not get a spoken response."
+        # Only the trusted handler close branch can emit a transport control.
+        # Agent prose and arbitrary handler strings remain speech, even when
+        # they exactly reproduce the reserved token.
+        from . import conversation_end
+        if result.get("runner") != "conversation_end":
+            response_text = conversation_end.agent_speech(response_text)
         events.emit(
             "reply",
             source="ha_assist",

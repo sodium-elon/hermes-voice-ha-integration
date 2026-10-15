@@ -89,6 +89,28 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result['response']['directives'],
                          [{'type': 'Display.RenderTemplate'}, bridge._query_directive()])
 
+
+    def test_gateway_end_signal_closes_without_query_capture(self):
+        result, _, _ = self.call({'type': 'IntentRequest', 'intent': {
+            'name': 'HermesIntent', 'slots': {'query': {'value': 'thanks'}}}}, {
+            'body': {'response': {
+                'outputSpeech': {'type': 'PlainText', 'text': bridge._END_SIGNAL},
+                'reprompt': {'outputSpeech': {'type': 'PlainText', 'text': 'Ready'}},
+                'directives': [bridge._query_directive()],
+                'shouldEndSession': False}}})
+        response = result['body']['response']
+        self.assertEqual(response['outputSpeech']['text'], 'Goodbye.')
+        self.assertTrue(response['shouldEndSession'])
+        self.assertNotIn('reprompt', response)
+        self.assertNotIn('directives', response)
+
+    def test_user_text_or_quoted_signal_cannot_close(self):
+        for text in ('You said ' + bridge._END_SIGNAL, 'Goodbye.', 'Thanks!'):
+            result, _, _ = self.call({'type': 'IntentRequest', 'intent': {
+                'name': 'HermesIntent', 'slots': {'query': {'value': bridge._END_SIGNAL}}}},
+                {'response': {'outputSpeech': {'type': 'PlainText', 'text': text}}})
+            self.assertFalse(result['response']['shouldEndSession'])
+
     def test_missing_token_does_not_send_request(self):
         with patch.dict(os.environ, {'BASE_URL': 'https://test.invalid'}), patch.object(bridge, '_debug', False):
             with self.assertRaisesRegex(AssertionError, 'access token'):

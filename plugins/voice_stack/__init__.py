@@ -271,7 +271,7 @@ def _run_full_agent(
         if profile == "sportscoach":
             return "Sports Coach returned no completion. The run import is not confirmed."
         raise RuntimeError("Hermes voice agent returned no response")
-    return response
+    return conversation_end.agent_speech(response)
 
 
 def _complete_voice_with_hermes(ctx: Any, text: str, *, profile: Optional[str] = None) -> str:
@@ -1242,7 +1242,7 @@ ALEXA_AGENT_SYSTEM_PROMPT = (
     "Use web or Home Assistant tools when they are needed to answer."
 )
 
-from . import alexa_confirmation
+from . import alexa_confirmation, conversation_end
 _ALEXA_PENDING = alexa_confirmation.PendingConfirmation()
 
 ALEXA_SESSION_ID = "alexa_hermes"
@@ -1438,16 +1438,24 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
             "busy": True,
         }
 
+    turn_started = time.monotonic()
     release_deferred = False
     arm_confirm = True
     work = None
     try:
         answer = {alexa_confirmation.YES: "yes", alexa_confirmation.NO: "no",
                   "yes": "yes", "no": "no"}.get(text.lower())
+        if answer is None:
+            polite = conversation_end.polite_binary(text)
+            if polite:
+                work = _ALEXA_PENDING.answer(polite)
+                if work is not None:
+                    answer = polite
         if answer is not None:
             # Native Yes/No intents and a plain answer forwarded by HermesIntent
             # belong to the current pending question, not a new routed task.
-            work = _ALEXA_PENDING.answer(answer)
+            if work is None:
+                work = _ALEXA_PENDING.answer(answer)
             if work is None:
                 return dict(ok=True, conversation_id=conversation_id,
                             text=alexa_confirmation.NO_PENDING)
@@ -1456,6 +1464,13 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
             text = work["text"]
             arm_confirm = False
         else:
+            if await conversation_end.should_end(text):
+                # End only the listening exchange. No agent task is dispatched,
+                # approved or cancelled by this result. Drop the voice question
+                # so a later yes cannot approve an abandoned exchange.
+                _ALEXA_PENDING.cancel()
+                return dict(ok=True, text=conversation_end.END_SIGNAL,
+                            conversation_id=conversation_id, runner="conversation_end")
             _ALEXA_PENDING.cancel()
             profile = _route_assist_profile(text)
 
@@ -1489,7 +1504,7 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
         try:
             response_text = await asyncio.wait_for(
                 asyncio.shield(asyncio.wrap_future(cf)),
-                timeout=ALEXA_AGENT_BUDGET_SECONDS,
+                timeout=max(0.001, ALEXA_AGENT_BUDGET_SECONDS - (time.monotonic() - turn_started)),
             )
             # Fast path: answer returns over the WebSocket (Alexa speaks it).
             # No done-callback is attached, so there is no duplicate spoken

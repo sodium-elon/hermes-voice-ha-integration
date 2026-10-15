@@ -51,3 +51,6 @@ HA reprompt "Please answer yes or no." and retains native YesIntent/NoIntent
 recognition without query-slot elicitation. Validate both long open questions
 and specialist yes/no context when changing either mode. Log only request type,
 intent and whether the query exists; never log raw envelopes or access tokens.
+
+Explicit conversation-ending judgment, its source-owned phrase corpus and relay-first
+deployment order are described in [conversation-ending.md](conversation-ending.md).
