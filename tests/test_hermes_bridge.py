@@ -111,6 +111,28 @@ class BridgeTests(unittest.TestCase):
                 {'response': {'outputSpeech': {'type': 'PlainText', 'text': text}}})
             self.assertFalse(result['response']['shouldEndSession'])
 
+    def test_session_end_reports_validation_error_without_forwarding_or_token(self):
+        event = {'request': {
+            'type': 'SessionEndedRequest', 'reason': 'ERROR',
+            'error': {'type': 'INVALID_RESPONSE',
+                      'message': 'The following directives are not supported: Dialog.ElicitSlot'}}}
+        with self.assertLogs(bridge._logger, level='WARNING') as logs, patch.object(
+                bridge.urllib3, 'PoolManager') as pool:
+            self.assertEqual(bridge.lambda_handler(event, None), {})
+        pool.assert_not_called()
+        self.assertIn('reason=ERROR error_type=INVALID_RESPONSE', logs.output[0])
+        self.assertIn('Dialog.ElicitSlot', logs.output[0])
+
+    def test_session_end_diagnostic_is_bounded_and_does_not_log_envelope(self):
+        event = {'session': {'user': {'accessToken': 'DO-NOT-LOG'}},
+                 'request': {'type': 'SessionEndedRequest', 'reason': 'USER_INITIATED',
+                             'error': {'message': 'x' * 600 + '\nsecret-tail'}}}
+        with self.assertLogs(bridge._logger, level='WARNING') as logs:
+            self.assertEqual(bridge.lambda_handler(event, None), {})
+        self.assertNotIn('DO-NOT-LOG', ''.join(logs.output))
+        self.assertNotIn('secret-tail', ''.join(logs.output))
+        self.assertLess(len(logs.output[0]), 650)
+
     def test_missing_token_does_not_send_request(self):
         with patch.dict(os.environ, {'BASE_URL': 'https://test.invalid'}), patch.object(bridge, '_debug', False):
             with self.assertRaisesRegex(AssertionError, 'access token'):
