@@ -91,3 +91,23 @@ state. HA accepting the launch service is not proof that a native Launch arrived
 If acceptance is followed by no Launch, the answer stays cached until its existing
 expiry; a manual skill opening can retrieve it. There is no asynchronous retry
 watchdog that could race with a late Launch and speak twice.
+
+## Native reopening validation, 15 October 2026
+
+A physical delayed-answer test exposed an Alexa INVALID_RESPONSE after speech:
+"The following directives are not supported: Dialog.ElicitSlot". A controlled
+skill-ID shortcut reproduced the same error immediately. The existing binary
+confirmation route does not return that directive and remains on its physically
+verified shortcut.
+
+General delayed answers now reopen using Alexa Media Player's custom command
+"open Hermes Assistant", a fixed invocation rather than user/model content.
+The controlled native launch returned READY with query elicitation and ended
+normally with EXCEEDED_MAX_REPROMPTS after no reply, instead of INVALID_RESPONSE.
+The primary Alexa Media Player 5.16.0 source supports custom through run_custom:
+https://github.com/alandtse/alexa_media_player/blob/v5.16.0/custom_components/alexa_media/media_player.py#L1843
+
+This distinguishes an accepted native listening response from the former error.
+It does not prove microphone recognition or an audible Goodbye; those require a
+separate user-controlled Echo test. No broad removal of query elicitation, model
+change, additional approval or confirmation-deadline extension is needed.

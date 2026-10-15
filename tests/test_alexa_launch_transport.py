@@ -52,3 +52,28 @@ def test_http_failure_is_not_launch_success(monkeypatch):
 
 def test_no_target_does_not_dispatch():
     assert alexa_confirmation.launch_skill('') is False
+
+
+def test_open_question_uses_native_utterance_instead_of_skill_shortcut(monkeypatch):
+    seen = []
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self): return b'[]'
+    def post(request, timeout):
+        seen.append(request)
+        return Response()
+    monkeypatch.setattr(urllib.request, 'urlopen', post)
+    assert alexa_confirmation.launch_open_question('media_player.asking_echo')
+    assert json.loads(seen[0].data) == {
+        'entity_id': 'media_player.asking_echo',
+        'media_content_type': 'custom',
+        'media_content_id': 'open Hermes Assistant',
+    }
+
+
+def test_open_question_transport_failure_preserves_fallback(monkeypatch):
+    def fail(*a, **k): raise OSError('fixture HA failure')
+    monkeypatch.setattr(urllib.request, 'urlopen', fail)
+    assert not alexa_confirmation.launch_open_question('media_player.asking_echo')
+    assert not alexa_confirmation.launch_open_question('')

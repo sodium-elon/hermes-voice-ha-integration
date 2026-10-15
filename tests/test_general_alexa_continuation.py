@@ -12,7 +12,7 @@ def general(monkeypatch):
     now = [0.0]
     pending = confirmation.PendingConfirmation(clock=lambda: now[0])
     launches, notifications = [], []
-    monkeypatch.setattr(confirmation, "launch_skill", lambda target: launches.append(target) or True)
+    monkeypatch.setattr(confirmation, "launch_open_question", lambda target: launches.append(target) or True)
     generation = pending.begin("Explain the tides", None, "general-session")
     def notify(text, *, target): notifications.append((text, target))
     return now, pending, generation, launches, notifications, notify
@@ -35,7 +35,7 @@ def test_slow_general_answer_reenters_asking_echo_and_is_spoken_once(general):
 
 def test_general_reentry_failure_falls_back_to_original_answer(general, monkeypatch):
     _, pending, g, _, notifications, notify = general
-    monkeypatch.setattr(confirmation, "launch_skill", lambda _: False)
+    monkeypatch.setattr(confirmation, "launch_open_question", lambda _: False)
     pending.deliver(g, "Original answer.", "media_player.asking_echo", notify)
     assert notifications == [("Original answer.", "media_player.asking_echo")]
     assert pending.pending is None
@@ -91,7 +91,7 @@ async def test_delayed_general_reply_then_farewell_reaches_closing_judge(monkeyp
         targets.append(target)
         launched.set()
         return True
-    monkeypatch.setattr(confirmation, "launch_skill", launch)
+    monkeypatch.setattr(confirmation, "launch_open_question", launch)
     def agent(text, **kw):
         calls.append(text)
         assert release.wait(2)
@@ -125,7 +125,7 @@ def test_general_reentry_io_does_not_block_launch_or_duplicate_fallback(general,
         entered.set()
         assert release.wait(2)
         return False
-    monkeypatch.setattr(confirmation, "launch_skill", network)
+    monkeypatch.setattr(confirmation, "launch_open_question", network)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         delivery = pool.submit(pending.deliver, g, "Answer.", "media_player.echo", notify)
         try:
@@ -143,7 +143,7 @@ def test_failed_old_reentry_cannot_clear_or_notify_over_new_request(general, mon
     def network(_):
         pending.begin("New question", None, "new-session")
         return False
-    monkeypatch.setattr(confirmation, "launch_skill", network)
+    monkeypatch.setattr(confirmation, "launch_open_question", network)
     pending.deliver(g, "Old answer.", "media_player.echo", notify)
     assert pending.pending.request == "New question"
     assert notifications == []
@@ -152,7 +152,7 @@ def test_failed_old_reentry_cannot_clear_or_notify_over_new_request(general, mon
 def test_general_reentry_exception_falls_back_without_losing_answer(general, monkeypatch):
     _, pending, g, _, notifications, notify = general
     def network(_): raise OSError("unavailable")
-    monkeypatch.setattr(confirmation, "launch_skill", network)
+    monkeypatch.setattr(confirmation, "launch_open_question", network)
     pending.deliver(g, "Answer.", "media_player.echo", notify)
     assert pending.pending is None
     assert notifications == [("Answer.", "media_player.echo")]
