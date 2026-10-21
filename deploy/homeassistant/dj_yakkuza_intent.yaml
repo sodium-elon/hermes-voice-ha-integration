@@ -1,0 +1,22 @@
+# Merge this intent into configuration.yaml; do not replace the whole configuration.
+intent_script:
+  DJYakkuzaIntent:
+    async_action: false
+    action:
+      - action: conversation.process
+        data:
+          agent_id: conversation.hermes
+          text: >-
+            here is for dj yakkuza: {{ query | default('', true) }}
+          language: en
+          conversation_id: alexa_dj_yakkuza
+        response_variable: dj_yakkuza_result
+      - stop: Return the DJ Yakkuza conversation response
+        response_variable: dj_yakkuza_result
+    speech:
+      type: plain
+      text: "{{ action_response.response.speech.plain.speech }}"
+    reprompt:
+      type: plain
+      text: "{{ action_response.response.speech.plain.extra_data.reprompt | default('', true) }}"
+

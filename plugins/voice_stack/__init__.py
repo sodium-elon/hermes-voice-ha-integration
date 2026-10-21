@@ -223,6 +223,7 @@ def _run_full_agent(
     profile: Optional[str] = None,
     session: Optional[str] = None,
     session_title: Optional[str] = None,
+    resolved_music_limit: Optional[str] = None,
 ) -> str:
     """Run one tool-capable Hermes turn for an unmatched voice query.
 
@@ -235,6 +236,14 @@ def _run_full_agent(
     separate voice surfaces (e.g. the Alexa skill via HA Assist) keep their
     own conversation thread and history.
     """
+    from .music_handoff import recording_path
+    if profile == "music" and recording_path(text) is None:
+        from .music_request_limits import prepare, forward_limit, Clarification
+        prepared = forward_limit(text, resolved_music_limit) if resolved_music_limit else prepare(text)
+        if prepared.get("clarification"):
+            return Clarification(prepared["clarification"])
+        resolved_music_limit = prepared.get("excluded_artist")
+        text = prepared["text"]
     started = time.monotonic()
     try:
         response = sessions_api.complete(
@@ -271,7 +280,10 @@ def _run_full_agent(
         if profile == "sportscoach":
             return "Sports Coach returned no completion. The run import is not confirmed."
         raise RuntimeError("Hermes voice agent returned no response")
-    return conversation_end.agent_speech(response)
+    response = conversation_end.agent_speech(response)
+    if resolved_music_limit:
+        response = f"Passed your request to DJ Yakkuza, excluding {resolved_music_limit}. {response}"
+    return response
 
 
 def _complete_voice_with_hermes(ctx: Any, text: str, *, profile: Optional[str] = None) -> str:
@@ -1443,6 +1455,16 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
     arm_confirm = True
     work = None
     try:
+        from .music_request_limits import PENDING, Clarification
+        resolved_music_limit = None
+        followup = PENDING.answer(conversation_id, text)
+        if followup:
+            if followup.get("cancelled"):
+                return dict(ok=True, text="Cancelled the pending music request.", conversation_id=conversation_id)
+            if followup.get("clarification"):
+                return dict(ok=True, text=followup["clarification"], reprompt=followup["clarification"], conversation_id=conversation_id)
+            text = followup["text"]
+            resolved_music_limit = followup["excluded_artist"]
         answer = {alexa_confirmation.YES: "yes", alexa_confirmation.NO: "no",
                   "yes": "yes", "no": "no"}.get(text.lower())
         if answer is None:
@@ -1498,6 +1520,7 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
             profile=profile,
             session=agent_session,
             session_title=agent_title,
+            **({"resolved_music_limit": resolved_music_limit} if resolved_music_limit else {}),
         )
         generation = (_ALEXA_PENDING.begin(text, profile, agent_session, session_title=agent_title, target_future=target_cf)
                       if arm_confirm else None)
@@ -1506,6 +1529,11 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
                 asyncio.shield(asyncio.wrap_future(cf)),
                 timeout=max(0.001, ALEXA_AGENT_BUDGET_SECONDS - (time.monotonic() - turn_started)),
             )
+            if isinstance(response_text, Clarification):
+                PENDING.remember(conversation_id, text)
+                _ALEXA_PENDING.cancel()
+                return dict(ok=True, text=str(response_text), reprompt=str(response_text),
+                            conversation_id=conversation_id, runner="music clarification", profile="music")
             # Fast path: answer returns over the WebSocket (Alexa speaks it).
             # No done-callback is attached, so there is no duplicate spoken
             # delivery through notify.alexa_media.
