@@ -122,7 +122,16 @@ async def _async_play_alexa_media(command: str, target: str) -> Dict[str, Any]:
         "media_content_type": "custom",
         "media_content_id": command,
     }
+    if __package__:
+        from . import playback_verification
+    else:
+        import playback_verification
     async with aiohttp.ClientSession() as session:
+        try:
+            baseline = await playback_verification.read_player(session, url, headers, target)
+        except Exception:
+            baseline = None
+        sent_at_ms = time.time() * 1000
         async with session.post(
             f"{url}/api/services/media_player/play_media",
             headers=headers,
@@ -144,7 +153,11 @@ async def _async_play_alexa_media(command: str, target: str) -> Dict[str, Any]:
                 for state in acknowledgement
             ):
                 raise RuntimeError("Invalid Home Assistant service acknowledgment")
-    return {"ok": True, "target": target, "command": command}
+        verification = await playback_verification.verify(
+            session, url, headers, target, command, baseline, sent_at_ms,
+        )
+    return {"ok": True, "target": target, "command": command,
+            "playback_verification": verification}
 
 
 def play_alexa_media(command: str, target: str) -> Dict[str, Any]:

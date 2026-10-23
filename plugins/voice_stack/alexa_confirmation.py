@@ -65,6 +65,17 @@ _IDENTITY_CONFIRM_RE = re.compile(
 )
 
 
+
+# Playback reports are observations, not permission to start another selection.
+# Match bounded binary questions, including the actual failed cafe-jazz reply.
+_PLAYBACK_CONFIRM_RE = re.compile(
+    r"\b(?:did (?:it|(?:the |that |this )?(?:[^.!?\n]*? )?(?:music|track|song|playlist|album)) start|can you hear (?:it|the music)|"
+    r"is (?:it|the music|[^.!?\n?]+) (?:coming through|playing|audible)|"
+    r"is (?:the|this) (?:selection|music|playlist) (?:right|correct))"
+    r"\?\s*$", re.IGNORECASE,
+)
+
+
 def eligible_confirmation(profile: str, reply: str) -> bool:
     """Recognize bounded yes/no requests from DJ or Sportscoach.
 
@@ -82,7 +93,7 @@ def eligible_confirmation(profile: str, reply: str) -> bool:
     text = re.sub(r"(?<=\d)\.(?=\d)", "_", text)
     if text.count("?") > 1 and re.search(r"\b(?:did|do) you mean\b", text, re.IGNORECASE):
         return False
-    return bool(_CONFIRM_RE.search(text) or _IDENTITY_CONFIRM_RE.search(text) or (
+    return bool((profile == "music" and text.count("?") == 1 and _PLAYBACK_CONFIRM_RE.search(text)) or _CONFIRM_RE.search(text) or _IDENTITY_CONFIRM_RE.search(text) or (
         profile == "sportscoach" and _COACH_CONFIRM_RE.search(text)
     ))
 

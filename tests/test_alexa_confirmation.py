@@ -381,3 +381,43 @@ def test_documented_query_and_launch_handlers_propagate_native_reprompt():
 ])
 def test_decimal_versions_preserve_binary_question_eligibility(reply):
     assert alexa_confirmation.eligible_confirmation("sportscoach", reply)
+
+
+@pytest.mark.parametrize("reply", [
+    "Music started, but I couldn’t verify the playlist—is the café jazz coming through?",
+    "I sent it. Did the music start?",
+    "The player still reports Chill Jazz. Did the French track start?",
+    "Did that song start?",
+    "The player reports music. Can you hear it?",
+    "Is the selection right?",
+])
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("answer", ["yes", "no"])
+def test_playback_report_keeps_native_answer_and_original_session(monkeypatch, reply, native, answer):
+    pending = alexa_confirmation.PendingConfirmation(clock=Clock())
+    generation = pending.begin("play French jazz", "music", "original-dj-session")
+    launches, notifications = [], []
+    monkeypatch.setattr(alexa_confirmation, "launch_skill", lambda target: launches.append(target) or True)
+    if native:
+        assert pending.native_response(generation, reply)["reprompt"]
+    else:
+        pending.deliver(generation, reply, "media_player.echo", lambda *a, **k: notifications.append(a))
+        assert launches == ["media_player.echo"]
+        assert notifications == []
+        assert pending.launch()["reprompt"]
+    work = pending.answer(answer)
+    assert work["session"] == "original-dj-session"
+    assert f"User answer: {answer}" in work["text"]
+    assert reply in work["text"]
+    assert pending.answer(answer) is None
+
+
+@pytest.mark.parametrize("reply", [
+    "Which music is playing?",
+    "What is coming through?",
+    "Did the music start? Which song?",
+    "Which playlist? Is it playing?",
+    "Music is playing.",
+])
+def test_playback_report_does_not_arm_open_questions(reply):
+    assert not alexa_confirmation.eligible_confirmation("music", reply)

@@ -14,6 +14,11 @@ class Response:
 @pytest.fixture
 def transport(monkeypatch):
     import aiohttp
+    from plugins.voice_stack import playback_verification as pv
+    async def baseline(*args, **kwargs): return None
+    async def verify(*args, **kwargs): return {'status': 'unverified', 'reason': 'telemetry_unavailable'}
+    monkeypatch.setattr(pv, 'read_player', baseline)
+    monkeypatch.setattr(pv, 'verify', verify)
     calls=[]
     def install(raw):
         class Session:
