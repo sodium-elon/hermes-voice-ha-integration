@@ -1,7 +1,7 @@
 ---
 name: alexa-voice-replies
 description: "Use immediately when John says answer through Alexa, reply through Alexa, say this on Alexa, speak through Alexa, or asks for voice on Echo speakers. Use Home Assistant notify.alexa_media TTS directly; never use notify.send_message and never add an intro or alter the requested words."
-version: 1.1.0
+version: 1.2.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -15,6 +15,14 @@ metadata:
 ## Trigger
 
 Load and execute this skill immediately when John asks to answer, reply, say, or speak through Alexa/Echo. Do not substitute Telegram audio unless he explicitly requests a Telegram voice message.
+
+## Sportscoach role and protected learning
+
+- Ordinary coaching and voice requests do not authorize coding, configuration changes, ingestion repair, or scheduled tasks.
+- Use Sportscoach's own tools and skills for legitimate coaching; do not turn missing data or a lost spoken answer into unsolicited maintenance. State the limitation and answer what the available evidence supports. Engineering maintenance belongs in the owning repository workflow, only when explicitly requested.
+- Load the main AlphaRunner `running-coaching` skill for coaching doctrine; do not duplicate its domain procedures here or in relay prompts. Preserve existing receipt/date/source checks, current-answer authorization and the 60-second wake expiry; this boundary adds no prerequisite gate to legitimate dispatch.
+- A protected skill correction refusal is a boundary to respect, not a failed learning task to bypass. Preserve the proposed learning correction and its evidence in the conversation; state that it is not installed. Route the proposal through the owning AlphaRunner source and a reviewed PR; never bypass protection with shell writes, another profile, or an alternate tool. This handoff is a proposal, not authorization to start coding, open a PR or deploy. Voice-only guidance belongs in this voice repository instead.
+- Profile capability policy is owned by AlphaRunner's `deploy/sportscoach-profile-policy.json`; voice transport does not grant tools or change profile policy. This Sportscoach boundary does not restrict the default/main profile's normal Alexa capabilities.
 
 ## Exact Workflow
 
@@ -47,7 +55,7 @@ ha_call_service(
 
 ## Listening and follow-up failures
 
-Use this branch when John reports a lost spoken answer or requests a listening repair. The short TTS workflow above is for one-way speech, not dialogue troubleshooting. Notification TTS does not itself open a microphone.
+Use this branch only for explicitly requested engineering diagnostics or listening repair, not merely because John reports a lost spoken answer. Preserve that report, explain the known limitation and offer the owning engineering workflow without launching it. The short TTS workflow above is for one-way speech, not dialogue troubleshooting. Notification TTS does not itself open a microphone. When diagnostics are explicitly requested, follow the existing layered procedure below within the authorized scope; permission to inspect is not permission to edit, deploy or restart.
 
 1. Preserve John's report that he answered. An absent transport event is not evidence that he failed to cooperate or stayed silent.
 2. Inspect original live receipts and voice events first; use session history as secondary context. Trace request → acknowledgement → completed question → native skill Launch → answer event, retaining timestamps and provenance. Never replay a historical yes as current authorization.
@@ -61,7 +69,7 @@ Protocol checks and safe reproduction: [references/native-alexa-followup-diagnos
 
 ## Completion
 
-A correct one-way TTS run normally needs one discovery call and one TTS service call—not terminal scripts, REST workarounds, or a small archaeological expedition. Listening repairs require the layered checks above.
+A correct one-way TTS run normally needs one discovery call and one TTS service call—not terminal scripts, REST workarounds, or a small archaeological expedition. Explicitly requested listening repairs require the layered checks above.
 
 ## Canonical source and synchronization
 

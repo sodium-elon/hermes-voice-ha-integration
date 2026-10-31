@@ -18,6 +18,12 @@ Sportscoach's run/coaching skills remain owned by sodium-elon/alpharunner, using
 
 Existing voice deadlines, real user authorization and one-shot answer rules remain unchanged.
 
+## Sportscoach role and learning ownership
+
+AlphaRunner owns coaching doctrine (`skills/running-coaching/SKILL.md`) and the profile capability contract `deploy/sportscoach-profile-policy.json`; this voice repository owns only transport and its profile-specific Alexa guidance. The Sessions API relay selects the target profile endpoint and sends session identity/title plus chat input/system text; it does not grant additional tools or override the target profile's toolsets. Existing receipt provenance and dated-shoe resolution are not engineering-maintenance authorization. Keep domain procedures in the owning coaching skill, not relay prompts.
+
+Ordinary coaching, missing data and lost spoken answers must not launch coding, configuration changes, ingestion repair or scheduled work. Full listening diagnostics require an explicit engineering request. A protected coaching-skill correction refusal preserves the proposed learning and evidence, marks it not installed, and hands it to the owning AlphaRunner source for a reviewed PR; shell writes, another profile or alternate-tool bypasses are not allowed. Voice-only corrections follow this repository's reviewed source workflow. Neither handoff authorizes implementation or deployment: PR author sodium-elon, reviewer johnroma, with John's GitHub approval required before merge/deploy. The default/main profile retains its normal Alexa capabilities.
+
 ## Completing and retiring feature work
 
 After a verified merge and main deployment, remove the completed feature checkout.
