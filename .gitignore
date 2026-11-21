@@ -41,3 +41,6 @@ local-config.yaml
 
 # Agent planner scratch (local only)
 .hermes/
+
+# Machine-local Claude Code permissions (keep shared .claude files tracked).
+/.claude/settings.local.json
